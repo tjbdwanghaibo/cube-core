@@ -79,6 +79,13 @@ type Engine struct {
 	cfg    Config
 }
 
+// RouteRegistrar is the minimal HTTP route contract used by higher-level
+// registration packages. Engine and Group both implement it.
+type RouteRegistrar interface {
+	Get(path string, handler http.HandlerFunc)
+	Post(path string, handler http.HandlerFunc)
+}
+
 func NewEngine(opts ...Option) *Engine {
 	cfg := defaultConfig()
 	for _, opt := range opts {
