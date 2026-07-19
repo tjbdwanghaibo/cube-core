@@ -8,7 +8,8 @@ import (
 
 // SaveItem is a single DAO snapshot produced by entity guard release.
 type SaveItem struct {
-	Db         string // database name
+	Db         string // logical database name
+	DbScope    DatabaseScope
 	Collection string
 	ID         int64
 	Version    uint64 // version after IncVersion

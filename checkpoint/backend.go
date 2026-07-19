@@ -12,6 +12,15 @@ const (
 	SaveModePatch
 )
 
+// DatabaseScope defines how a logical database name is resolved by storage.
+// DatabaseScopeServer appends the runtime server ID to the logical name.
+type DatabaseScope uint8
+
+const (
+	DatabaseScopeGlobal DatabaseScope = iota
+	DatabaseScopeServer
+)
+
 // PersistPatch is a field-level persistence update.
 //
 // Set and Unset are DAO field names, not database-internal paths. Storage
@@ -98,6 +107,7 @@ type PersistPatcher interface {
 // SaveOp represents a single document save operation.
 type SaveOp struct {
 	Db         string
+	DbScope    DatabaseScope
 	Collection string
 	ID         int64
 	Version    uint64
@@ -117,6 +127,7 @@ type SaveResult struct {
 // RemoveOp represents a batch remove operation.
 type RemoveOp struct {
 	Db         string
+	DbScope    DatabaseScope
 	Collection string
 	IDs        []int64
 }
@@ -131,6 +142,8 @@ type RawDoc struct {
 
 // LoadOp describes a bulk load request.
 type LoadOp struct {
+	Db         string
+	DbScope    DatabaseScope
 	Collection string
 	Filter     map[string]any // optional query filter
 	BatchSize  int            // cursor batch size hint

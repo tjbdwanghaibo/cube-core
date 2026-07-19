@@ -70,6 +70,14 @@ func TestRedisSnapshotWALTargetIncludesDatabase(t *testing.T) {
 	}
 }
 
+func TestRedisSnapshotWALTargetSeparatesServerScopedDatabase(t *testing.T) {
+	global := redisSnapshotWALTarget(SaveItem{Db: "game", Collection: "players", ID: 1001})
+	server := redisSnapshotWALTarget(SaveItem{Db: "game", DbScope: DatabaseScopeServer, Collection: "players", ID: 1001})
+	if global == server {
+		t.Fatalf("global and server scoped WAL targets must differ: %q", global)
+	}
+}
+
 func TestRedisSnapshotWALAckRunsAfterQueuedWrite(t *testing.T) {
 	ctx := context.Background()
 	redis := newSnapshotWALFakeRedis()

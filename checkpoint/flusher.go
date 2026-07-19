@@ -148,9 +148,10 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 	// snapshot replaces earlier patches. We only commit dirty masks after the
 	// merged write succeeds, so a failed flush can roll back to a full save.
 	type key struct {
-		db   string
-		coll string
-		id   int64
+		db      string
+		dbScope DatabaseScope
+		coll    string
+		id      int64
 	}
 	saveMap := make(map[key]SaveItem)
 	removes = make(map[removeKey][]int64)
@@ -159,13 +160,13 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 		for _, item := range entry.Items {
 			if item.Version == 0 && item.Data == nil {
 				// Remove operation
-				rk := removeKey{db: item.Db, coll: item.Collection}
+				rk := removeKey{db: item.Db, dbScope: item.DbScope, coll: item.Collection}
 				removes[rk] = append(removes[rk], item.ID)
 				// Also remove from saveMap if present
-				delete(saveMap, key{item.Db, item.Collection, item.ID})
+				delete(saveMap, key{item.Db, item.DbScope, item.Collection, item.ID})
 				continue
 			}
-			k := key{item.Db, item.Collection, item.ID}
+			k := key{item.Db, item.DbScope, item.Collection, item.ID}
 			if existing, ok := saveMap[k]; ok {
 				saveMap[k] = mergeSaveItem(existing, item)
 			} else {
@@ -182,6 +183,9 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 		if saves[i].Db != saves[j].Db {
 			return saves[i].Db < saves[j].Db
 		}
+		if saves[i].DbScope != saves[j].DbScope {
+			return saves[i].DbScope < saves[j].DbScope
+		}
 		if saves[i].Collection != saves[j].Collection {
 			return saves[i].Collection < saves[j].Collection
 		}
@@ -191,8 +195,9 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 }
 
 type removeKey struct {
-	db   string
-	coll string
+	db      string
+	dbScope DatabaseScope
+	coll    string
 }
 
 func mergeSaveItem(existing SaveItem, next SaveItem) SaveItem {
@@ -272,6 +277,7 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 	for i, item := range items {
 		ops[i] = SaveOp{
 			Db:         item.Db,
+			DbScope:    item.DbScope,
 			Collection: item.Collection,
 			ID:         item.ID,
 			Version:    item.Version,
@@ -344,13 +350,16 @@ func (f *Flusher) flushRemoves(ctx context.Context, removes map[removeKey][]int6
 		if keys[i].db != keys[j].db {
 			return keys[i].db < keys[j].db
 		}
+		if keys[i].dbScope != keys[j].dbScope {
+			return keys[i].dbScope < keys[j].dbScope
+		}
 		return keys[i].coll < keys[j].coll
 	})
 	for _, key := range keys {
 		ids := removes[key]
 		backoff := f.cfg.RetryBackoff
 		for {
-			err := f.backend.BulkRemove(ctx, RemoveOp{Db: key.db, Collection: key.coll, IDs: ids})
+			err := f.backend.BulkRemove(ctx, RemoveOp{Db: key.db, DbScope: key.dbScope, Collection: key.coll, IDs: ids})
 			if err == nil {
 				break
 			}

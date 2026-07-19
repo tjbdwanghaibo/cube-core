@@ -1,8 +1,9 @@
 package entity
 
 import (
-	"github.com/tjbdwanghaibo/cube-core/lock"
 	"fmt"
+	"github.com/tjbdwanghaibo/cube-core/checkpoint"
+	"github.com/tjbdwanghaibo/cube-core/lock"
 )
 
 // IThreadSafeEntity is the full entity interface for the nest framework.
@@ -63,6 +64,12 @@ type DaoInterface interface {
 	CollName() string
 	Dirty() IDirty
 	CleanDirty()
+}
+
+// DatabaseScopedDao optionally declares how its logical database name is
+// resolved by the storage service.
+type DatabaseScopedDao interface {
+	DbScope() checkpoint.DatabaseScope
 }
 
 // Guardable is implemented by entities that expose DAO instances for

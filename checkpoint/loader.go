@@ -15,6 +15,8 @@ type EntityExister interface {
 
 // LoadTemplate describes how to load a specific collection.
 type LoadTemplate struct {
+	Db         string
+	DbScope    DatabaseScope
 	Collection string
 	DependsOn  []string               // collections that must load first
 	Filter     map[string]any         // additional query filter
@@ -94,6 +96,8 @@ func (l *Loader) loadOne(ctx context.Context, t *LoadTemplate) error {
 	start := time.Now()
 
 	op := LoadOp{
+		Db:         t.Db,
+		DbScope:    t.DbScope,
 		Collection: t.Collection,
 		Filter:     t.Filter,
 		BatchSize:  t.BatchSize,

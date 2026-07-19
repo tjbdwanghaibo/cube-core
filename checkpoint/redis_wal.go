@@ -67,18 +67,21 @@ type SnapshotWALStats struct {
 }
 
 type redisSnapshotWALPayload struct {
-	Db         string   `json:"db,omitempty"`
-	Collection string   `json:"collection"`
-	ID         int64    `json:"id"`
-	Version    uint64   `json:"version"`
-	Mask       uint64   `json:"mask,omitempty"`
-	Mode       SaveMode `json:"mode"`
-	Data       []byte   `json:"data"`
-	CreatedAt  int64    `json:"created_at"`
+	Db         string        `json:"db,omitempty"`
+	DbScope    DatabaseScope `json:"db_scope,omitempty"`
+	Collection string        `json:"collection"`
+	ID         int64         `json:"id"`
+	Version    uint64        `json:"version"`
+	Mask       uint64        `json:"mask,omitempty"`
+	Mode       SaveMode      `json:"mode"`
+	Data       []byte        `json:"data"`
+	CreatedAt  int64         `json:"created_at"`
 }
 
 func (p redisSnapshotWALPayload) saveOp() SaveOp {
 	return SaveOp{
+		Db:         p.Db,
+		DbScope:    p.DbScope,
 		Collection: p.Collection,
 		ID:         p.ID,
 		Version:    p.Version,
@@ -375,6 +378,7 @@ func (w *RedisSnapshotWAL) writeTask(item SaveItem) (redisSnapshotWALTask, bool)
 	target := redisSnapshotWALTarget(item)
 	payload := redisSnapshotWALPayload{
 		Db:         item.Db,
+		DbScope:    item.DbScope,
 		Collection: item.Collection,
 		ID:         item.ID,
 		Version:    item.Version,
@@ -621,6 +625,9 @@ func redisSnapshotWALPayloadTarget(payload redisSnapshotWALPayload) string {
 }
 
 func redisSnapshotWALTarget(item SaveItem) string {
+	if item.DbScope == DatabaseScopeServer {
+		return item.Db + "|server|" + item.Collection + "|" + strconv.FormatInt(item.ID, 10)
+	}
 	if item.Db != "" {
 		return item.Db + "|" + item.Collection + "|" + strconv.FormatInt(item.ID, 10)
 	}
