@@ -2,6 +2,7 @@ package webroute
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -93,5 +94,31 @@ func TestReadRawCopiesRequestData(t *testing.T) {
 	}
 	if got := raw.Header.Get("X-Test"); got != "one" {
 		t.Fatalf("header = %q", got)
+	}
+}
+
+type testModule struct {
+	calls *int
+	err   error
+}
+
+func (m testModule) RegisterRoutes(Registerer) error {
+	*m.calls++
+	return m.err
+}
+
+func TestRegisterModulesStopsOnFirstError(t *testing.T) {
+	calls := 0
+	wantErr := errors.New("register failed")
+	err := RegisterModules(nil,
+		testModule{calls: &calls},
+		testModule{calls: &calls, err: wantErr},
+		testModule{calls: &calls},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if calls != 2 {
+		t.Fatalf("calls = %d, want 2", calls)
 	}
 }

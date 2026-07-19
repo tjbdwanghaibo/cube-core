@@ -19,6 +19,25 @@ type Registerer interface {
 	Register(method, path string, handler http.HandlerFunc) error
 }
 
+// Module registers a package-owned set of HTTP routes.
+type Module interface {
+	RegisterRoutes(Registerer) error
+}
+
+// RegisterModules installs modules in order and stops at the first error.
+// A shared Registerer makes duplicate method/path pairs fail across packages.
+func RegisterModules(reg Registerer, modules ...Module) error {
+	for _, module := range modules {
+		if module == nil {
+			return errors.New("webroute: route module is required")
+		}
+		if err := module.RegisterRoutes(reg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Registrar installs routes through httpserver while rejecting duplicated
 // method/path pairs before chi receives them.
 type Registrar struct {
