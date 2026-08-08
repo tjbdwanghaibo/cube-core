@@ -6,7 +6,12 @@ type IThreadSafeRemoteEntity interface {
 	IThreadSafeEntity
 	EntityVersion() int64
 	SetEntityVersion(int64)
-	ExcludeSId() int32 // 0=remote-marked(other server owns), >0=local(this server owns)
+	// ExcludeSId is the current ownership sid. Zero means the entity is
+	// remotely shared/owned; a positive sid means that server owns the local
+	// fast path. It is not the source of truth for whether the entity is
+	// registered as remotely shared.
+	ExcludeSId() int32
+	// SetExcludeSId updates the current ownership sid.
 	SetExcludeSId(int32)
 
 	// OnDataChange applies synced data from another server.

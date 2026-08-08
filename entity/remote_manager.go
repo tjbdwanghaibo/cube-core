@@ -49,27 +49,38 @@ type IRemoteEntityLoader interface {
 	// Returns nil if entity does not exist.
 	LoadRemoteEntity(id int64, kind EntityKind) IThreadSafeRemoteEntity
 	// SaveRemoteEntity persists dirty entity state.
-	SaveRemoteEntity(e IThreadSafeRemoteEntity) error
+	SaveRemoteEntity(e IThreadSafeRemoteEntity, lease RemoteEntityMarkerLease) error
 	// SnapshotRemoteEntitySync samples sync dirty fields and returns a payload
 	// plus commit/rollback callbacks. It does not persist data.
 	SnapshotRemoteEntitySync(e IThreadSafeRemoteEntity) RemoteSyncSnapshot
 	// DelRemoteEntity deletes entity from DB.
-	DelRemoteEntity(e IThreadSafeRemoteEntity) error
+	DelRemoteEntity(e IThreadSafeRemoteEntity, lease RemoteEntityMarkerLease) error
 	// CheckEntityExist checks if entity exists in DB without loading.
 	CheckEntityExist(id int64, kind EntityKind) bool
 }
 
-// IRemoteEntityMarkerStore provides remote entity mark persistence.
-// A "mark" indicates entity is exclusively held by a server for remote access.
+// IRemoteEntityMarkerStore provides fenced remote entity mark persistence.
+// A "mark" indicates that the entity participates in multi-server ownership
+// and therefore must use the distributed lock path. Local wrapper state is
+// only a performance cache and must not be persisted as the mark.
 type IRemoteEntityMarkerStore interface {
-	// IsMarked checks if entity is currently marked (reads from cache/Redis).
-	IsMarked(ctx context.Context, id int64) (bool, error)
-	// Mark stores mark for entity (called under dist lock protection).
-	Mark(ctx context.Context, id int64) error
-	// Unmark removes mark.
-	Unmark(ctx context.Context, id int64) error
+	GetMarker(ctx context.Context, id int64) (bool, RemoteEntityMarkerLease, error)
+	Mark(ctx context.Context, id int64, ownerSid int32) (RemoteEntityMarkerLease, error)
+	// Unmark transitions a shared entity back to its local owner and returns
+	// the next ownership generation. Implementations must never reuse a fence.
+	Unmark(ctx context.Context, id int64, lease RemoteEntityMarkerLease) (RemoteEntityMarkerLease, error)
 }
 
+// RemoteEntityMarkerLease identifies one ownership generation. Implementations
+// should reject releases and writes made with an older fence.
+type RemoteEntityMarkerLease struct {
+	OwnerSid int32
+	Fence    uint64
+	Shared   bool
+}
+
+// IRemoteEntityMarkerStore stores marker state and a monotonically increasing
+// fencing token. Mark/unmark transitions must validate the token.
 // IRemoteEntitySyncer broadcasts entity changes to other servers holding the entity.
 type IRemoteEntitySyncer interface {
 	// SyncEntity publishes entity data change to subscribers.

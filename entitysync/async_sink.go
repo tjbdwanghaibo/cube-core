@@ -134,6 +134,9 @@ func (s *AsyncSink) Drain(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	done := make(chan struct{})
 	go func() {
 		s.wg.Wait()

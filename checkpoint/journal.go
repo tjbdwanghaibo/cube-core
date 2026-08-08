@@ -13,6 +13,7 @@ type SaveItem struct {
 	Collection string
 	ID         int64
 	Version    uint64 // version after IncVersion
+	Fence      uint64 // remote ownership generation; zero is an unfenced local save
 	Mask       uint64 // field-level dirty mask sampled under entity lock
 	Mode       SaveMode
 	Data       []byte       // full serialized data
@@ -74,6 +75,7 @@ func (j *Journal) PushWithContext(ctx context.Context, items []SaveItem) bool {
 	if len(items) == 0 {
 		return true
 	}
+
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -103,6 +105,25 @@ func (j *Journal) PushWithContext(ctx context.Context, items []SaveItem) bool {
 
 	// Signal flusher that data is available
 	j.popReady.Signal()
+	return true
+}
+
+// PushFront requeues entries that were popped but could not be persisted.
+func (j *Journal) PushFront(entries []JournalEntry) bool {
+	if len(entries) == 0 {
+		return true
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if j.closed {
+		return false
+	}
+	requeued := make([]JournalEntry, 0, len(entries)+len(j.entries))
+	requeued = append(requeued, entries...)
+	requeued = append(requeued, j.entries...)
+	j.entries = requeued
+	j.popReady.Broadcast()
+	j.cond.Broadcast()
 	return true
 }
 

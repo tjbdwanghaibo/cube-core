@@ -111,6 +111,9 @@ type SaveOp struct {
 	Collection string
 	ID         int64
 	Version    uint64
+	Fence      uint64
+	OwnerSid   int32
+	Shared     bool
 	Mask       uint64
 	Mode       SaveMode
 	Data       []byte       // full serialized document (e.g. BSON)

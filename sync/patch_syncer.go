@@ -27,6 +27,10 @@ type PatchSyncer[T any] struct {
 	unsub func()
 }
 
+type contextPublisher interface {
+	PublishContext(context.Context, *SyncMsg) error
+}
+
 func NewPatchSyncer[T any](bus ISyncBus, cfg PatchSyncerConfig[T]) *PatchSyncer[T] {
 	return &PatchSyncer[T]{bus: bus, cfg: cfg}
 }
@@ -72,7 +76,18 @@ func (s *PatchSyncer[T]) Publish(ctx context.Context, patch T) error {
 	if err != nil {
 		return err
 	}
-	_ = ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if publisher, ok := s.bus.(contextPublisher); ok {
+		return publisher.PublishContext(ctx, &SyncMsg{
+			Topic: s.cfg.Topic, Key: key, Version: time.Now().UnixMilli(),
+			Data: data, FromSid: s.cfg.LocalSid,
+		})
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return s.bus.Publish(&SyncMsg{
 		Topic:   s.cfg.Topic,
 		Key:     key,

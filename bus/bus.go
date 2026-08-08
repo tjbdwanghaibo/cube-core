@@ -2,12 +2,12 @@ package bus
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/nats"
 	"github.com/tjbdwanghaibo/cube-core/obs"
 	"github.com/tjbdwanghaibo/cube-core/worker"
-	"errors"
-	"fmt"
 	"log/slog"
 	"runtime/debug"
 	"strings"
@@ -286,8 +286,9 @@ func (b *Bus) stopLocked(ctx context.Context) error {
 		if !sub.IsValid() {
 			continue
 		}
-		if err := sub.Unsubscribe(); err != nil {
-			slog.Warn("bus: unsubscribe failed", "err", err)
+		if unsubscribeErr := sub.Unsubscribe(); unsubscribeErr != nil {
+			slog.Warn("bus: unsubscribe failed", "err", unsubscribeErr)
+			err = errors.Join(err, unsubscribeErr)
 		}
 	}
 	b.subs = nil

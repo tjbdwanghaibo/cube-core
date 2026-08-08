@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
@@ -127,11 +128,17 @@ func (f *Flusher) processBatch(ctx context.Context, entries []JournalEntry) erro
 
 	if len(saves) > 0 {
 		if err := f.flushSaves(ctx, saves); err != nil {
+			if !f.journal.PushFront(saveJournalEntries(saves)) {
+				slog.Error("checkpoint requeue saves failed", "err", err)
+			}
 			return err
 		}
 	}
 	if len(removes) > 0 {
 		if err := f.flushRemoves(ctx, removes); err != nil {
+			if !f.journal.PushFront(removeJournalEntries(removes)) {
+				slog.Error("checkpoint requeue removes failed", "err", err)
+			}
 			return err
 		}
 	}
@@ -281,6 +288,7 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 			Collection: item.Collection,
 			ID:         item.ID,
 			Version:    item.Version,
+			Fence:      item.Fence,
 			Mask:       item.Mask,
 			Mode:       item.Mode,
 			Data:       item.Data,
@@ -303,6 +311,10 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 			}
 			backoff = min(backoff*2, f.cfg.RetryMaxBack)
 			continue
+		}
+		if len(results) != len(items) {
+			rollbackPersistItems(items)
+			return fmt.Errorf("checkpoint backend returned %d save results for %d items", len(results), len(items))
 		}
 
 		// Process results
@@ -339,6 +351,31 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 		}
 		return nil
 	}
+}
+
+func removeJournalEntries(removes map[removeKey][]int64) []JournalEntry {
+	entries := make([]JournalEntry, 0, len(removes))
+	for key, ids := range removes {
+		items := make([]SaveItem, 0, len(ids))
+		for _, id := range ids {
+			items = append(items, SaveItem{
+				Db: key.db, DbScope: key.dbScope, Collection: key.coll, ID: id,
+			})
+		}
+		entries = append(entries, JournalEntry{Items: items, PushAt: time.Now().UnixNano()})
+	}
+	return entries
+}
+
+func saveJournalEntries(items []SaveItem) []JournalEntry {
+	entries := make([]JournalEntry, 0, len(items))
+	for _, item := range items {
+		entries = append(entries, JournalEntry{
+			Items:  []SaveItem{item},
+			PushAt: time.Now().UnixNano(),
+		})
+	}
+	return entries
 }
 
 func (f *Flusher) flushRemoves(ctx context.Context, removes map[removeKey][]int64) error {

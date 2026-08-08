@@ -2,10 +2,10 @@ package nest
 
 import (
 	"context"
-	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
-	"github.com/tjbdwanghaibo/cube-core/entity"
 	"errors"
 	"fmt"
+	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
+	"github.com/tjbdwanghaibo/cube-core/entity"
 	"log/slog"
 	"time"
 )
@@ -148,12 +148,15 @@ func StopNestWithContext(ctx context.Context) error {
 	}
 	var err error
 	if Nest != nil {
-		Nest.ticker.Stop()
-		err = Nest.dispatcher.OnDestroyWithContext(ctx)
-		Nest = nil
+		mgr := Nest
+		mgr.ticker.Stop()
+		err = mgr.dispatcher.OnDestroyWithContext(ctx)
+		if err == nil {
+			Nest = nil
+			InitGlobalGetter(nil)
+			entity.SendMsg = nil
+		}
 	}
-	InitGlobalGetter(nil)
-	entity.SendMsg = nil
 	return err
 }
 

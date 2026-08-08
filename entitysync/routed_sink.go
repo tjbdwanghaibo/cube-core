@@ -2,12 +2,12 @@ package entitysync
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/entity"
 	"github.com/tjbdwanghaibo/cube-core/obs"
 	fsync "github.com/tjbdwanghaibo/cube-core/sync"
-	"encoding/json"
-	"fmt"
 	"sync"
 	"time"
 )
@@ -184,12 +184,13 @@ func (s *RoutedSink) Stop() {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.unsub != nil {
-		s.unsub()
-	}
+	unsub := s.unsub
 	s.unsub = nil
 	s.started = false
+	s.mu.Unlock()
+	if unsub != nil {
+		unsub()
+	}
 }
 
 func (s *RoutedSink) Enqueue(packet entity.SyncPacket) {
@@ -333,7 +334,10 @@ func (s *RoutedSink) resolveRoute(ctx context.Context, observer entity.SyncObser
 		return ObserverRoute{Observer: observer, Sid: observer.Sid}, true, nil
 	}
 	if s.resolver == nil {
-		if id := observer.PlayerID(); id != 0 && s.localSink != nil {
+		s.mu.Lock()
+		localSink := s.localSink
+		s.mu.Unlock()
+		if id := observer.PlayerID(); id != 0 && localSink != nil {
 			return ObserverRoute{Observer: observer, Sid: s.localSid}, true, nil
 		}
 		return ObserverRoute{}, false, nil

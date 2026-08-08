@@ -144,6 +144,12 @@ func (l *Loader) topoSort(templates []LoadTemplate) ([]int, error) {
 	// Build adjacency: collection name → index
 	nameToIdx := make(map[string]int, len(templates))
 	for i, t := range templates {
+		if t.Collection == "" {
+			return nil, fmt.Errorf("checkpoint loader: template %d has empty collection", i)
+		}
+		if _, exists := nameToIdx[t.Collection]; exists {
+			return nil, fmt.Errorf("checkpoint loader: duplicate collection %q", t.Collection)
+		}
 		nameToIdx[t.Collection] = i
 	}
 
@@ -156,9 +162,11 @@ func (l *Loader) topoSort(templates []LoadTemplate) ([]int, error) {
 	for i, t := range templates {
 		nodes[i].idx = i
 		for _, dep := range t.DependsOn {
-			if depIdx, ok := nameToIdx[dep]; ok {
-				nodes[i].deps = append(nodes[i].deps, depIdx)
+			depIdx, ok := nameToIdx[dep]
+			if !ok {
+				return nil, fmt.Errorf("checkpoint loader: collection %q depends on unknown collection %q", t.Collection, dep)
 			}
+			nodes[i].deps = append(nodes[i].deps, depIdx)
 		}
 	}
 
