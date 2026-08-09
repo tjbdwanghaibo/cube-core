@@ -1,6 +1,9 @@
 package entity
 
-import "sync"
+import (
+	"context"
+	"sync"
+)
 
 // RemoteEntityPrepareFunc prepares remote entities before dispatch.
 // Input: remote entity IDs that need to be loaded/locked.
@@ -11,15 +14,25 @@ type RemoteEntityPrepareFunc func(ids []int64) (release func(), err error)
 type RemoteEntityMarkedFunc func(id int64) bool
 type RemoteSnapshotResolveFunc func(req RemoteSnapshotResolveRequest) (RemoteSnapshot, error)
 
+// RemotePersistenceLeaseResolveFunc resolves the current ownership generation
+// for a normal persistence snapshot. A shared entity must be persisted through
+// its remote wrapper instead of this ordinary asynchronous path.
+type RemotePersistenceLeaseResolveFunc func(ctx context.Context, id int64) (RemoteEntityMarkerLease, bool, error)
+
 type remoteEntityMarkedChecker interface {
 	IsRemoteMarked(id int64) bool
 }
 
+type remoteEntityPersistenceLeaseResolver interface {
+	ResolveRemotePersistenceLease(ctx context.Context, id int64) (RemoteEntityMarkerLease, bool, error)
+}
+
 var remoteEntityHooks struct {
-	mu              sync.RWMutex
-	preparer        RemoteEntityPrepareFunc
-	marked          RemoteEntityMarkedFunc
-	snapshotResolve RemoteSnapshotResolveFunc
+	mu               sync.RWMutex
+	preparer         RemoteEntityPrepareFunc
+	marked           RemoteEntityMarkedFunc
+	snapshotResolve  RemoteSnapshotResolveFunc
+	persistenceLease RemotePersistenceLeaseResolveFunc
 }
 
 func PrepareRemoteEntities(ids []int64) (func(), bool, error) {
@@ -62,6 +75,19 @@ func ResolveRemoteSnapshot(req RemoteSnapshotResolveRequest) (RemoteSnapshot, bo
 	return snapshot, true, err
 }
 
+// ResolveRemotePersistenceLease returns the current remote ownership epoch for
+// a normal asynchronous snapshot. managed is false when no remote manager owns
+// the entity kind. Callers must not persist a managed shared entity this way.
+func ResolveRemotePersistenceLease(ctx context.Context, id int64) (RemoteEntityMarkerLease, bool, error) {
+	remoteEntityHooks.mu.RLock()
+	resolver := remoteEntityHooks.persistenceLease
+	remoteEntityHooks.mu.RUnlock()
+	if resolver == nil {
+		return RemoteEntityMarkerLease{}, false, nil
+	}
+	return resolver(ctx, id)
+}
+
 // BindRemoteEntityManager wires IRemoteEntityManager into framework hooks.
 // Called by RemoteEntityMod during Start().
 func BindRemoteEntityManager(mgr IRemoteEntityManager) {
@@ -81,6 +107,11 @@ func BindRemoteEntityManager(mgr IRemoteEntityManager) {
 	remoteEntityHooks.snapshotResolve = func(req RemoteSnapshotResolveRequest) (RemoteSnapshot, error) {
 		return mgr.ResolveRemoteSnapshot(req)
 	}
+	if resolver, ok := mgr.(remoteEntityPersistenceLeaseResolver); ok {
+		remoteEntityHooks.persistenceLease = resolver.ResolveRemotePersistenceLease
+	} else {
+		remoteEntityHooks.persistenceLease = nil
+	}
 	remoteEntityHooks.mu.Unlock()
 }
 
@@ -92,5 +123,6 @@ func UnbindRemoteEntityManager(mgr IRemoteEntityManager) {
 	remoteEntityHooks.preparer = nil
 	remoteEntityHooks.marked = nil
 	remoteEntityHooks.snapshotResolve = nil
+	remoteEntityHooks.persistenceLease = nil
 	remoteEntityHooks.mu.Unlock()
 }

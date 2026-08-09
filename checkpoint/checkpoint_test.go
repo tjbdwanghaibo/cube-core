@@ -337,7 +337,7 @@ func TestCheckpoint_SubmitAndFlush(t *testing.T) {
 	m2 := d2.TakePersistDirty()
 
 	cp.Submit([]SaveItem{
-		{Collection: "players", ID: 100, Version: v1, Mask: m1, Data: []byte("p100"), Tracker: &d1},
+		{Collection: "players", ID: 100, Version: v1, Fence: 7, OwnerSid: 1001, Shared: true, Mask: m1, Data: []byte("p100"), Tracker: &d1},
 		{Collection: "players", ID: 200, Version: v2, Mask: m2, Data: []byte("p200"), Tracker: &d2},
 	})
 
@@ -349,6 +349,12 @@ func TestCheckpoint_SubmitAndFlush(t *testing.T) {
 	saved := backend.getSaved()
 	if len(saved) != 2 {
 		t.Fatalf("expected 2 saved ops, got %d", len(saved))
+	}
+	if saved[0].ID == 100 && (saved[0].Fence != 7 || saved[0].OwnerSid != 1001 || !saved[0].Shared) {
+		t.Fatalf("ownership metadata was not forwarded: %#v", saved[0])
+	}
+	if saved[1].ID == 100 && (saved[1].Fence != 7 || saved[1].OwnerSid != 1001 || !saved[1].Shared) {
+		t.Fatalf("ownership metadata was not forwarded: %#v", saved[1])
 	}
 
 	// Trackers should be committed
@@ -473,7 +479,7 @@ func TestCheckpointSubmitRemoveItemsPreservesDbForBackendAndWAL(t *testing.T) {
 	cp := New(backend, WithSnapshotWAL(wal), WithFlushWorkers(0))
 
 	if ok := cp.SubmitRemoveItems([]SaveItem{
-		{Db: "game_1", Collection: "players", ID: 1001},
+		{Db: "game_1", Collection: "players", ID: 1001, Fence: 9, OwnerSid: 1001, Shared: true},
 		{Db: "game_2", Collection: "players", ID: 1001},
 	}); !ok {
 		t.Fatal("SubmitRemoveItems returned false")
@@ -488,6 +494,9 @@ func TestCheckpointSubmitRemoveItemsPreservesDbForBackendAndWAL(t *testing.T) {
 	}
 	if backend.removed[0].Db != "game_1" || backend.removed[1].Db != "game_2" {
 		t.Fatalf("removed ops = %+v, want db game_1/game_2", backend.removed)
+	}
+	if op := backend.removed[0]; op.Fence != 9 || op.OwnerSid != 1001 || !op.Shared {
+		t.Fatalf("fenced remove metadata was not forwarded: %+v", op)
 	}
 	if len(wal.acked) == 0 || len(wal.acked[0]) != 2 {
 		t.Fatalf("wal acked = %+v, want two db-scoped items", wal.acked)

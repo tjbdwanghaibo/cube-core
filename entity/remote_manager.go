@@ -71,6 +71,15 @@ type IRemoteEntityMarkerStore interface {
 	Unmark(ctx context.Context, id int64, lease RemoteEntityMarkerLease) (RemoteEntityMarkerLease, error)
 }
 
+// IRemoteEntityMarkerCASStore optionally strengthens Mark with an expected
+// local ownership generation. Implementations should atomically reject the
+// transition if another server changed the marker while the caller waited for
+// the distributed entity lock.
+type IRemoteEntityMarkerCASStore interface {
+	IRemoteEntityMarkerStore
+	MarkExpected(ctx context.Context, id int64, expected RemoteEntityMarkerLease) (RemoteEntityMarkerLease, error)
+}
+
 // RemoteEntityMarkerLease identifies one ownership generation. Implementations
 // should reject releases and writes made with an older fence.
 type RemoteEntityMarkerLease struct {

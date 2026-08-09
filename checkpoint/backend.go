@@ -133,6 +133,9 @@ type RemoveOp struct {
 	DbScope    DatabaseScope
 	Collection string
 	IDs        []int64
+	Fence      uint64
+	OwnerSid   int32
+	Shared     bool
 }
 
 // RawDoc is a loaded document with metadata.

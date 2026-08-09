@@ -167,7 +167,7 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 		for _, item := range entry.Items {
 			if item.Version == 0 && item.Data == nil {
 				// Remove operation
-				rk := removeKey{db: item.Db, dbScope: item.DbScope, coll: item.Collection}
+				rk := removeKey{db: item.Db, dbScope: item.DbScope, coll: item.Collection, fence: item.Fence, ownerSid: item.OwnerSid, shared: item.Shared}
 				removes[rk] = append(removes[rk], item.ID)
 				// Also remove from saveMap if present
 				delete(saveMap, key{item.Db, item.DbScope, item.Collection, item.ID})
@@ -202,9 +202,12 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 }
 
 type removeKey struct {
-	db      string
-	dbScope DatabaseScope
-	coll    string
+	db       string
+	dbScope  DatabaseScope
+	coll     string
+	fence    uint64
+	ownerSid int32
+	shared   bool
 }
 
 func mergeSaveItem(existing SaveItem, next SaveItem) SaveItem {
@@ -289,6 +292,8 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 			ID:         item.ID,
 			Version:    item.Version,
 			Fence:      item.Fence,
+			OwnerSid:   item.OwnerSid,
+			Shared:     item.Shared,
 			Mask:       item.Mask,
 			Mode:       item.Mode,
 			Data:       item.Data,
@@ -360,6 +365,7 @@ func removeJournalEntries(removes map[removeKey][]int64) []JournalEntry {
 		for _, id := range ids {
 			items = append(items, SaveItem{
 				Db: key.db, DbScope: key.dbScope, Collection: key.coll, ID: id,
+				Fence: key.fence, OwnerSid: key.ownerSid, Shared: key.shared,
 			})
 		}
 		entries = append(entries, JournalEntry{Items: items, PushAt: time.Now().UnixNano()})
@@ -396,7 +402,7 @@ func (f *Flusher) flushRemoves(ctx context.Context, removes map[removeKey][]int6
 		ids := removes[key]
 		backoff := f.cfg.RetryBackoff
 		for {
-			err := f.backend.BulkRemove(ctx, RemoveOp{Db: key.db, DbScope: key.dbScope, Collection: key.coll, IDs: ids})
+			err := f.backend.BulkRemove(ctx, RemoveOp{Db: key.db, DbScope: key.dbScope, Collection: key.coll, IDs: ids, Fence: key.fence, OwnerSid: key.ownerSid, Shared: key.shared})
 			if err == nil {
 				break
 			}

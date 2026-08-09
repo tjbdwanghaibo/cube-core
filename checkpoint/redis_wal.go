@@ -73,6 +73,8 @@ type redisSnapshotWALPayload struct {
 	ID         int64         `json:"id"`
 	Version    uint64        `json:"version"`
 	Fence      uint64        `json:"fence,omitempty"`
+	OwnerSid   int32         `json:"owner_sid,omitempty"`
+	Shared     bool          `json:"shared,omitempty"`
 	Mask       uint64        `json:"mask,omitempty"`
 	Mode       SaveMode      `json:"mode"`
 	Data       []byte        `json:"data"`
@@ -87,6 +89,8 @@ func (p redisSnapshotWALPayload) saveOp() SaveOp {
 		ID:         p.ID,
 		Version:    p.Version,
 		Fence:      p.Fence,
+		OwnerSid:   p.OwnerSid,
+		Shared:     p.Shared,
 		Mask:       p.Mask,
 		Mode:       SaveModeFull,
 		Data:       append([]byte(nil), p.Data...),
@@ -385,6 +389,8 @@ func (w *RedisSnapshotWAL) writeTask(item SaveItem) (redisSnapshotWALTask, bool)
 		ID:         item.ID,
 		Version:    item.Version,
 		Fence:      item.Fence,
+		OwnerSid:   item.OwnerSid,
+		Shared:     item.Shared,
 		Mask:       item.Mask,
 		Mode:       item.Mode,
 		Data:       append([]byte(nil), data...),

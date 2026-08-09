@@ -2,10 +2,10 @@ package app
 
 import (
 	"context"
-	"github.com/tjbdwanghaibo/cube-core/clock"
-	"github.com/tjbdwanghaibo/cube-core/lifecycle"
 	"errors"
 	"fmt"
+	"github.com/tjbdwanghaibo/cube-core/clock"
+	"github.com/tjbdwanghaibo/cube-core/lifecycle"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -13,11 +13,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/spf13/cobra"
+	"github.com/spf13/viper"
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	flog "github.com/tjbdwanghaibo/cube-core/log"
 	"github.com/tjbdwanghaibo/cube-core/nest"
-	"github.com/spf13/cobra"
-	"github.com/spf13/viper"
 )
 
 // App is the top-level application container.
@@ -33,6 +33,11 @@ type App struct {
 	// runtime
 	registry *Registry
 	cfg      *viper.Viper
+
+	// signalSource exists to make shutdown sequencing testable on platforms
+	// where a process cannot deliver os.Interrupt to itself (notably Windows).
+	// Production leaves it nil and uses the process signal notifier below.
+	signalSource func() (<-chan os.Signal, func())
 }
 
 // serviceEntry holds a service and its specific mods.
@@ -137,6 +142,9 @@ func (a *App) run(serverType ServiceName) error {
 	}); err != nil {
 		return fmt.Errorf("init log: %w", err)
 	}
+	// This App run owns the configured sink. Close it before returning so a
+	// subsequent run can safely rotate or remove the same file on Windows.
+	defer func() { _ = flog.Close() }()
 
 	slog.Info("starting server",
 		"name", a.name,
@@ -262,9 +270,8 @@ func (a *App) run(serverType ServiceName) error {
 
 	// Register signal handling before Serve can expose readiness and receive
 	// external termination.
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	defer signal.Stop(sigChan)
+	sigChan, stopSignals := a.exitSignals()
+	defer stopSignals()
 
 	// Serve in background, wait for signal
 	ctx, cancel := context.WithCancel(context.Background())
@@ -348,6 +355,15 @@ func (a *App) run(serverType ServiceName) error {
 		Name:    string(svc.Name()),
 	})
 	return errors.Join(serviceErr, shutdownErr)
+}
+
+func (a *App) exitSignals() (<-chan os.Signal, func()) {
+	if a.signalSource != nil {
+		return a.signalSource()
+	}
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+	return ch, func() { signal.Stop(ch) }
 }
 
 func defaultServiceConfigPath(serverType ServiceName) string {

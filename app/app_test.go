@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -159,10 +158,14 @@ func TestAppWaitsForServeExitBeforeShutdownAfterSignal(t *testing.T) {
 	svc := newSlowSignalService()
 	a := newTestApp(t, svc)
 	a.RootCmd().SetArgs([]string{"game"})
+	signals := make(chan os.Signal, 1)
+	a.signalSource = func() (<-chan os.Signal, func()) {
+		return signals, func() {}
+	}
 
 	go func() {
 		<-svc.started
-		_ = syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		signals <- os.Interrupt
 	}()
 
 	if err := a.Execute(); err != nil {

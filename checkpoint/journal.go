@@ -14,6 +14,8 @@ type SaveItem struct {
 	ID         int64
 	Version    uint64 // version after IncVersion
 	Fence      uint64 // remote ownership generation; zero is an unfenced local save
+	OwnerSid   int32  // owner recorded for the ownership generation
+	Shared     bool   // whether the ownership generation is in shared mode
 	Mask       uint64 // field-level dirty mask sampled under entity lock
 	Mode       SaveMode
 	Data       []byte       // full serialized data
