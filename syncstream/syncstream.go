@@ -5,21 +5,26 @@
 package syncstream
 
 import (
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 )
 
 var (
 	ErrTopicRequired                = errors.New("syncstream: topic is required")
 	ErrAckAhead                     = errors.New("syncstream: acknowledgement is ahead of the stream")
+	ErrAckEpochMismatch             = errors.New("syncstream: acknowledgement epoch does not match the stream")
 	ErrPayloadTooLarge              = errors.New("syncstream: payload exceeds configured limit")
 	ErrStreamLimit                  = errors.New("syncstream: stream limit reached")
 	ErrSchemaTransitionRequiresFull = errors.New("syncstream: schema transition requires a full packet")
 	ErrSnapshotProviderRequired     = errors.New("syncstream: snapshot provider is required")
 	ErrInvalidSnapshot              = errors.New("syncstream: invalid history snapshot")
 	ErrHistoryStoreRequired         = errors.New("syncstream: history store is required")
+	ErrHistoryJournalRequired       = errors.New("syncstream: history journal is required")
 )
 
 const HistorySnapshotVersion uint32 = 1
@@ -44,6 +49,7 @@ type Stream struct {
 type Packet struct {
 	Observer      Observer
 	Stream        Stream
+	Epoch         uint64
 	Sequence      uint64
 	BaseSequence  uint64
 	SchemaVersion uint32
@@ -74,14 +80,21 @@ type HistoryOptions struct {
 	SchemaVersion       uint32
 	MaxPayloadBytes     int
 	MaxStreams          int
+	Epoch               uint64
+	IdleTTL             time.Duration
+	// PruneAcknowledged releases packets as soon as every packet through the
+	// acknowledged sequence is no longer needed for replay.
+	PruneAcknowledged bool
 }
 
 type streamState struct {
-	latest  uint64
-	acked   uint64
-	dropped uint64
-	schema  uint32
-	items   []Packet
+	latest   uint64
+	acked    uint64
+	dropped  uint64
+	pruned   uint64
+	schema   uint32
+	activity int64
+	items    []Packet
 }
 
 // History sequences and retains packets independently for every observer and
@@ -89,6 +102,8 @@ type streamState struct {
 type History struct {
 	mutex   sync.RWMutex
 	options HistoryOptions
+	epoch   uint64
+	journal HistoryJournal
 	streams map[streamKey]*streamState
 }
 
@@ -104,7 +119,20 @@ func NewHistory(options HistoryOptions) *History {
 	if options.SchemaVersion == 0 {
 		options.SchemaVersion = 1
 	}
-	return &History{options: options, streams: make(map[streamKey]*streamState)}
+	if options.Epoch == 0 {
+		options.Epoch = newEpoch()
+	}
+	return &History{options: options, epoch: options.Epoch, streams: make(map[streamKey]*streamState)}
+}
+
+func newEpoch() uint64 {
+	var data [8]byte
+	if _, err := rand.Read(data[:]); err == nil {
+		if value := binary.LittleEndian.Uint64(data[:]); value != 0 {
+			return value
+		}
+	}
+	return uint64(time.Now().UnixNano()) | 1
 }
 
 // Append assigns the next per-stream sequence and retains a detached packet.
@@ -119,16 +147,19 @@ func (history *History) Append(packet Packet) (Packet, error) {
 	defer history.mutex.Unlock()
 	key := streamKey{Observer: packet.Observer, Stream: packet.Stream}
 	state := history.streams[key]
+	created := false
 	if state == nil {
 		if history.options.MaxStreams > 0 && len(history.streams) >= history.options.MaxStreams {
 			return Packet{}, ErrStreamLimit
 		}
 		state = &streamState{}
 		history.streams[key] = state
+		created = true
 	}
 	if packet.SchemaVersion == 0 {
 		packet.SchemaVersion = history.options.SchemaVersion
 	}
+	packet.Epoch = history.epoch
 	if state.latest > 0 && packet.SchemaVersion != state.schema && !packet.Full {
 		return Packet{}, ErrSchemaTransitionRequiresFull
 	}
@@ -139,8 +170,17 @@ func (history *History) Append(packet Packet) (Packet, error) {
 		packet.BaseSequence = state.latest
 	}
 	packet = packet.Clone()
+	if history.journal != nil {
+		if err := history.journal.Record(HistoryMutation{Version: HistoryMutationVersion, Kind: HistoryMutationAppend, Epoch: history.epoch, Packet: packet.Clone()}); err != nil {
+			if created {
+				delete(history.streams, key)
+			}
+			return Packet{}, err
+		}
+	}
 	state.latest = packet.Sequence
 	state.schema = packet.SchemaVersion
+	state.activity = time.Now().UnixNano()
 	state.items = append(state.items, packet)
 	if overflow := len(state.items) - history.options.MaxPacketsPerStream; overflow > 0 {
 		copy(state.items, state.items[overflow:])
@@ -153,8 +193,15 @@ func (history *History) Append(packet Packet) (Packet, error) {
 // Acknowledge records monotonic consumer progress. History stays bounded by the
 // configured limit; acknowledgements are used for diagnostics and recovery.
 func (history *History) Acknowledge(observer Observer, stream Stream, sequence uint64) error {
+	return history.AcknowledgeEpoch(observer, stream, history.Epoch(), sequence)
+}
+
+func (history *History) AcknowledgeEpoch(observer Observer, stream Stream, epoch, sequence uint64) error {
 	history.mutex.Lock()
 	defer history.mutex.Unlock()
+	if epoch != history.epoch {
+		return ErrAckEpochMismatch
+	}
 	state := history.streams[streamKey{Observer: observer, Stream: stream}]
 	if state == nil {
 		if sequence == 0 {
@@ -166,7 +213,23 @@ func (history *History) Acknowledge(observer Observer, stream Stream, sequence u
 		return ErrAckAhead
 	}
 	if sequence > state.acked {
+		if history.journal != nil {
+			if err := history.journal.Record(HistoryMutation{Version: HistoryMutationVersion, Kind: HistoryMutationAcknowledge, Epoch: history.epoch, Observer: observer, Stream: stream, Sequence: sequence, PruneAcknowledged: history.options.PruneAcknowledged}); err != nil {
+				return err
+			}
+		}
 		state.acked = sequence
+		if history.options.PruneAcknowledged {
+			pruned := 0
+			for pruned < len(state.items) && state.items[pruned].Sequence <= sequence {
+				pruned++
+			}
+			if pruned > 0 {
+				state.items = append([]Packet(nil), state.items[pruned:]...)
+				state.pruned += uint64(pruned)
+			}
+		}
+		state.activity = time.Now().UnixNano()
 	}
 	return nil
 }
@@ -179,11 +242,13 @@ const (
 	ResyncHistoryGap     ResyncReason = "history_gap"
 	ResyncSchemaMismatch ResyncReason = "schema_mismatch"
 	ResyncClientAhead    ResyncReason = "client_ahead"
+	ResyncEpochMismatch  ResyncReason = "epoch_mismatch"
 )
 
 type ResyncRequest struct {
 	Observer      Observer
 	Stream        Stream
+	Epoch         uint64
 	AfterSequence uint64
 	SchemaVersion uint32
 }
@@ -235,6 +300,9 @@ func (history *History) Resync(request ResyncRequest) ResyncResult {
 	history.mutex.RLock()
 	defer history.mutex.RUnlock()
 	state := history.streams[streamKey{Observer: request.Observer, Stream: request.Stream}]
+	if request.Epoch != 0 && request.Epoch != history.epoch {
+		return ResyncResult{FullRequired: true, Reason: ResyncEpochMismatch}
+	}
 	if state == nil {
 		return ResyncResult{FullRequired: true, Reason: ResyncHistoryMissing}
 	}
@@ -286,11 +354,13 @@ func (history *History) Resync(request ResyncRequest) ResyncResult {
 }
 
 type StreamStatus struct {
+	Epoch          uint64
 	LatestSequence uint64
 	AckedSequence  uint64
 	OldestSequence uint64
 	Pending        uint64
 	Dropped        uint64
+	Pruned         uint64
 	Retained       int
 }
 
@@ -302,10 +372,12 @@ func (history *History) Status(observer Observer, stream Stream) StreamStatus {
 		return StreamStatus{}
 	}
 	status := StreamStatus{
+		Epoch:          history.epoch,
 		LatestSequence: state.latest,
 		AckedSequence:  state.acked,
 		Pending:        state.latest - state.acked,
 		Dropped:        state.dropped,
+		Pruned:         state.pruned,
 		Retained:       len(state.items),
 	}
 	if len(state.items) > 0 {
@@ -317,19 +389,22 @@ func (history *History) Status(observer Observer, stream Stream) StreamStatus {
 // HistoryMetrics is a lock-consistent aggregate suitable for health checks and
 // metrics exporters.
 type HistoryMetrics struct {
+	Epoch    uint64
 	Streams  int
 	Retained uint64
 	Dropped  uint64
+	Pruned   uint64
 	Pending  uint64
 }
 
 func (history *History) Metrics() HistoryMetrics {
 	history.mutex.RLock()
 	defer history.mutex.RUnlock()
-	metrics := HistoryMetrics{Streams: len(history.streams)}
+	metrics := HistoryMetrics{Epoch: history.epoch, Streams: len(history.streams)}
 	for _, state := range history.streams {
 		metrics.Retained += uint64(len(state.items))
 		metrics.Dropped += state.dropped
+		metrics.Pruned += state.pruned
 		metrics.Pending += state.latest - state.acked
 	}
 	return metrics
@@ -339,30 +414,41 @@ func (history *History) Metrics() HistoryMetrics {
 // Export and Import always detach packet payloads.
 type HistorySnapshot struct {
 	Version uint32
+	Epoch   uint64
 	Streams []HistoryStreamSnapshot
 }
 
 type HistoryStreamSnapshot struct {
-	Observer Observer
-	Stream   Stream
-	Latest   uint64
-	Acked    uint64
-	Dropped  uint64
-	Packets  []Packet
+	Observer             Observer
+	Stream               Stream
+	Latest               uint64
+	Acked                uint64
+	Dropped              uint64
+	Pruned               uint64
+	Schema               uint32
+	LastActivityUnixNano int64
+	Packets              []Packet
 }
 
 func (history *History) Export() HistorySnapshot {
 	history.mutex.RLock()
 	defer history.mutex.RUnlock()
-	result := HistorySnapshot{Version: HistorySnapshotVersion, Streams: make([]HistoryStreamSnapshot, 0, len(history.streams))}
+	return history.exportLocked()
+}
+
+func (history *History) exportLocked() HistorySnapshot {
+	result := HistorySnapshot{Version: HistorySnapshotVersion, Epoch: history.epoch, Streams: make([]HistoryStreamSnapshot, 0, len(history.streams))}
 	for key, state := range history.streams {
 		stream := HistoryStreamSnapshot{
-			Observer: key.Observer,
-			Stream:   key.Stream,
-			Latest:   state.latest,
-			Acked:    state.acked,
-			Dropped:  state.dropped,
-			Packets:  make([]Packet, len(state.items)),
+			Observer:             key.Observer,
+			Stream:               key.Stream,
+			Latest:               state.latest,
+			Acked:                state.acked,
+			Dropped:              state.dropped,
+			Pruned:               state.pruned,
+			Schema:               state.schema,
+			LastActivityUnixNano: state.activity,
+			Packets:              make([]Packet, len(state.items)),
 		}
 		for index := range state.items {
 			stream.Packets[index] = state.items[index].Clone()
@@ -396,6 +482,9 @@ func (history *History) Import(snapshot HistorySnapshot) error {
 	if snapshot.Version != HistorySnapshotVersion {
 		return fmt.Errorf("%w: unsupported version %d", ErrInvalidSnapshot, snapshot.Version)
 	}
+	if snapshot.Epoch == 0 {
+		return fmt.Errorf("%w: epoch is required", ErrInvalidSnapshot)
+	}
 	if history.options.MaxStreams > 0 && len(snapshot.Streams) > history.options.MaxStreams {
 		return ErrStreamLimit
 	}
@@ -409,15 +498,19 @@ func (history *History) Import(snapshot HistorySnapshot) error {
 		if _, exists := streams[key]; exists {
 			return fmt.Errorf("%w: duplicate stream", ErrInvalidSnapshot)
 		}
-		if item.Acked > item.Latest || (item.Latest > 0 && len(item.Packets) == 0) {
+		if item.Acked > item.Latest || (item.Latest > 0 && len(item.Packets) == 0 && item.Acked != item.Latest) {
 			return fmt.Errorf("%w: inconsistent sequence metadata", ErrInvalidSnapshot)
 		}
-		state := &streamState{latest: item.Latest, acked: item.Acked, dropped: item.Dropped}
+		activity := item.LastActivityUnixNano
+		if activity == 0 {
+			activity = time.Now().UnixNano()
+		}
+		state := &streamState{latest: item.Latest, acked: item.Acked, dropped: item.Dropped, pruned: item.Pruned, schema: item.Schema, activity: activity}
 		var previous uint64
 		var previousSchema uint32
 		for packetIndex := range item.Packets {
 			packet := item.Packets[packetIndex]
-			if packet.Observer != item.Observer || packet.Stream != item.Stream || packet.Sequence == 0 || packet.SchemaVersion == 0 {
+			if packet.Observer != item.Observer || packet.Stream != item.Stream || packet.Epoch != snapshot.Epoch || packet.Sequence == 0 || packet.SchemaVersion == 0 {
 				return fmt.Errorf("%w: packet identity mismatch", ErrInvalidSnapshot)
 			}
 			if history.options.MaxPayloadBytes > 0 && len(packet.Payload) > history.options.MaxPayloadBytes {
@@ -451,10 +544,14 @@ func (history *History) Import(snapshot HistorySnapshot) error {
 		if len(state.items) > 0 {
 			state.schema = state.items[len(state.items)-1].SchemaVersion
 		}
+		if state.latest > 0 && state.schema == 0 {
+			return fmt.Errorf("%w: stream schema is required", ErrInvalidSnapshot)
+		}
 		streams[key] = state
 	}
 	history.mutex.Lock()
 	history.streams = streams
+	history.epoch = snapshot.Epoch
 	history.mutex.Unlock()
 	return nil
 }

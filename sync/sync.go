@@ -2,11 +2,15 @@ package sync
 
 // SyncMsg is the wire format for a sync message.
 type SyncMsg struct {
-	Topic   string // sync topic (e.g. "remote_entity", "config")
-	Key     int64  // business key (entity ID, config ID, etc.)
-	Version int64  // data version, subscriber uses to discard stale messages
-	Data    []byte // serialized business data (nil means delete)
-	FromSid int32  // sender server ID
+	Topic    string // sync topic (e.g. "remote_entity", "config")
+	Key      int64  // business key (entity ID, config ID, etc.)
+	Version  int64  // data version, subscriber uses to discard stale messages
+	Data     []byte // serialized business data (nil means delete)
+	FromSid  int32  // sender server ID
+	Part     uint32 // zero-based part index when Parts > 1
+	Parts    uint32 // total part count; zero/one means an unfragmented message
+	Encoding string // optional payload encoding, e.g. gzip
+	Checksum string // SHA-256 of the decoded business payload
 }
 
 // Handler processes an incoming sync message.
