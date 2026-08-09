@@ -2,8 +2,10 @@ package syncstream
 
 import (
 	"errors"
+	"os"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestHistoryAppendReplayAndAck(t *testing.T) {
@@ -37,6 +39,24 @@ func TestHistoryAppendReplayAndAck(t *testing.T) {
 	}
 	if err := history.Acknowledge(observer, stream, 3); !errors.Is(err, ErrAckAhead) {
 		t.Fatalf("ack ahead error = %v", err)
+	}
+}
+
+func BenchmarkHistoryAppendAcknowledge(b *testing.B) {
+	history := NewHistory(HistoryOptions{MaxPacketsPerStream: 256, Epoch: 1, PruneAcknowledged: true})
+	observer := Observer{ID: 1}
+	stream := Stream{Topic: "state", Key: 1}
+	payload := make([]byte, 256)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		packet, err := history.Append(Packet{Observer: observer, Stream: stream, Payload: payload})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if err := history.AcknowledgeEpoch(observer, stream, packet.Epoch, packet.Sequence); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -200,5 +220,188 @@ func TestHistoryStoreSaveAndRestore(t *testing.T) {
 	}
 	if err := target.Save(nil); !errors.Is(err, ErrHistoryStoreRequired) {
 		t.Fatalf("nil store error = %v", err)
+	}
+}
+
+type memoryJournal struct {
+	snapshot  HistorySnapshot
+	mutations []HistoryMutation
+	recordErr error
+}
+
+func (journal *memoryJournal) Load() (HistorySnapshot, error) { return journal.snapshot, nil }
+func (journal *memoryJournal) Record(mutation HistoryMutation) error {
+	if journal.recordErr != nil {
+		return journal.recordErr
+	}
+	journal.mutations = append(journal.mutations, mutation)
+	return nil
+}
+func (journal *memoryJournal) Checkpoint(snapshot HistorySnapshot) error {
+	journal.snapshot = snapshot
+	journal.mutations = nil
+	return nil
+}
+
+func TestDurableHistoryWritesAheadAndDoesNotMutateOnJournalFailure(t *testing.T) {
+	seed := NewHistory(HistoryOptions{Epoch: 77}).Export()
+	journal := &memoryJournal{snapshot: seed}
+	history, err := NewHistoryWithJournal(HistoryOptions{}, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet, err := history.Append(Packet{Observer: Observer{ID: 1}, Stream: Stream{Topic: "state"}, Payload: []byte("one")})
+	if err != nil || packet.Epoch != 77 || len(journal.mutations) != 1 || journal.mutations[0].Kind != HistoryMutationAppend {
+		t.Fatalf("append=%#v mutations=%#v err=%v", packet, journal.mutations, err)
+	}
+	journal.recordErr = errors.New("disk full")
+	if err := history.Acknowledge(packet.Observer, packet.Stream, packet.Sequence); err == nil {
+		t.Fatal("expected journal failure")
+	}
+	if status := history.Status(packet.Observer, packet.Stream); status.AckedSequence != 0 {
+		t.Fatalf("failed journal mutated ACK: %#v", status)
+	}
+	other := Stream{Topic: "other"}
+	if _, err := history.Append(Packet{Observer: packet.Observer, Stream: other}); err == nil {
+		t.Fatal("expected journal failure")
+	}
+	if status := history.Status(packet.Observer, other); status.Retained != 0 {
+		t.Fatalf("failed journal retained empty stream: %#v", status)
+	}
+}
+
+func TestEpochLifecycleAndIdleSweep(t *testing.T) {
+	history := NewHistory(HistoryOptions{Epoch: 11, IdleTTL: time.Hour})
+	observer := Observer{ID: 2}
+	stream := Stream{Topic: "state"}
+	packet, _ := history.Append(Packet{Observer: observer, Stream: stream})
+	if result := history.Resync(ResyncRequest{Observer: observer, Stream: stream, Epoch: 10}); !result.FullRequired || result.Reason != ResyncEpochMismatch {
+		t.Fatalf("epoch mismatch = %#v", result)
+	}
+	if removed, err := history.SweepIdle(time.Now().Add(2 * time.Hour)); err != nil || removed != 1 {
+		t.Fatalf("sweep removed=%d err=%v", removed, err)
+	}
+	_, _ = history.Append(Packet{Observer: observer, Stream: stream})
+	_, _ = history.Append(Packet{Observer: observer, Stream: Stream{Topic: "presentation"}})
+	if removed, err := history.DeleteObserver(observer); err != nil || removed != 2 {
+		t.Fatalf("delete observer removed=%d err=%v", removed, err)
+	}
+	if err := history.RotateEpoch(12); err != nil || history.Epoch() != 12 {
+		t.Fatalf("rotate epoch=%d err=%v", history.Epoch(), err)
+	}
+	if packet.Epoch != 11 {
+		t.Fatalf("packet epoch = %d", packet.Epoch)
+	}
+}
+
+func TestFileHistoryJournalRecoversCheckpointAndWAL(t *testing.T) {
+	directory := t.TempDir()
+	journal, err := NewFileHistoryJournal(directory, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := NewHistoryWithJournal(HistoryOptions{MaxPacketsPerStream: 8}, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := Observer{ID: 4}
+	stream := Stream{Topic: "state"}
+	first, err := history.Append(Packet{Observer: observer, Stream: stream, Full: true, Payload: []byte("first")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.AcknowledgeEpoch(observer, stream, first.Epoch, first.Sequence); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	second, err := history.Append(Packet{Observer: observer, Stream: stream, Payload: []byte("second")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedJournal, err := NewFileHistoryJournal(directory, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewHistoryWithJournal(HistoryOptions{MaxPacketsPerStream: 8}, reopenedJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := reopened.Status(observer, stream)
+	if status.Epoch != 91 || status.LatestSequence != second.Sequence || status.AckedSequence != first.Sequence {
+		t.Fatalf("status=%#v", status)
+	}
+	replay := reopened.Resync(ResyncRequest{Observer: observer, Stream: stream, Epoch: 91, AfterSequence: 1})
+	if replay.FullRequired || len(replay.Packets) != 1 || string(replay.Packets[0].Payload) != "second" {
+		t.Fatalf("replay=%#v", replay)
+	}
+}
+
+func TestAcknowledgementPrunesAndJournalRecoversPrunedStream(t *testing.T) {
+	directory := t.TempDir()
+	journal, err := NewFileHistoryJournal(directory, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := NewHistoryWithJournal(HistoryOptions{PruneAcknowledged: true}, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	observer := Observer{ID: 5}
+	stream := Stream{Topic: "state"}
+	first, err := history.Append(Packet{Observer: observer, Stream: stream, Full: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := history.AcknowledgeEpoch(observer, stream, first.Epoch, first.Sequence); err != nil {
+		t.Fatal(err)
+	}
+	if status := history.Status(observer, stream); status.Retained != 0 || status.Pruned != 1 {
+		t.Fatalf("status after prune = %#v", status)
+	}
+
+	reopenedJournal, err := NewFileHistoryJournal(directory, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := NewHistoryWithJournal(HistoryOptions{PruneAcknowledged: true}, reopenedJournal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	status := reopened.Status(observer, stream)
+	if status.LatestSequence != 1 || status.AckedSequence != 1 || status.Retained != 0 || status.Pruned != 1 {
+		t.Fatalf("reopened status = %#v", status)
+	}
+	second, err := reopened.Append(Packet{Observer: observer, Stream: stream})
+	if err != nil || second.Sequence != 2 || second.BaseSequence != 1 {
+		t.Fatalf("continued packet = %#v, err=%v", second, err)
+	}
+}
+
+func TestFileHistoryJournalFailsClosedOnNewestGenerationCorruption(t *testing.T) {
+	journal, err := NewFileHistoryJournal(t.TempDir(), 201)
+	if err != nil {
+		t.Fatal(err)
+	}
+	history, err := NewHistoryWithJournal(HistoryOptions{}, journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := history.Append(Packet{Stream: Stream{Topic: "state"}, Full: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := history.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(journal.checkpointPath(journal.generation), []byte("corrupt"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, _ := NewFileHistoryJournal(journal.directory, 1)
+	if _, err := NewHistoryWithJournal(HistoryOptions{}, reopened); err == nil {
+		t.Fatal("expected newest generation corruption to stop recovery")
 	}
 }
