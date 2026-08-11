@@ -101,6 +101,98 @@ func TestEntitySyncPackerRunsUnderEntityLock(t *testing.T) {
 	}
 }
 
+func TestEntitySyncSetPackerKeepsEntityLockWrapper(t *testing.T) {
+	id := mustBuildTestEntityID(t, 110, EntityCategory(1), EntityKind(2))
+	base := NewEntityBase(id, EntityCategory(1), false, EntityKind(2))
+	mu := &observedSyncMutex{id: id}
+	base.mu = mu
+	base.EnableSync(EntitySyncCreateParam{Enabled: true, Topic: "replaced"})
+	base.Sync().SetPacker(EntitySyncPackFunc{
+		Enter: func(SyncObserverRef) (SyncPacket, error) {
+			if !mu.Held() {
+				t.Fatal("SetPacker enter should run while entity lock is held")
+			}
+			return SyncPacket{Body: "enter"}, nil
+		},
+		Update: func(SyncObserverRef, uint64) (SyncPacket, error) {
+			if !mu.Held() {
+				t.Fatal("SetPacker update should run while entity lock is held")
+			}
+			return SyncPacket{Body: "update"}, nil
+		},
+	})
+	if _, ok := base.Sync().AddObserverRef(NewPlayerSyncObserver(210)); !ok {
+		t.Fatal("AddObserverRef should produce an enter packet")
+	}
+	base.MarkSyncDirty(1)
+	if packets := base.FlushSyncNow(); len(packets) != 1 || packets[0].Body != "update" {
+		t.Fatalf("FlushSyncNow packets=%+v", packets)
+	}
+}
+
+func TestEntitySyncManualPolicyRequiresExplicitFlush(t *testing.T) {
+	oldScheduler := GetEntitySyncScheduler()
+	defer SetEntitySyncScheduler(oldScheduler)
+	scheduler := &testSyncScheduler{}
+	SetEntitySyncScheduler(scheduler)
+
+	id := mustBuildTestEntityID(t, 111, EntityCategory(1), EntityKind(2))
+	ent := &factoryTestEntity{EntityBase: NewEntityBase(id, EntityCategory(1), false, EntityKind(2))}
+	ent.EnableSync(EntitySyncCreateParam{
+		Enabled:     true,
+		Topic:       "manual",
+		FlushPolicy: SyncFlushManual,
+		Packer: EntitySyncPackFunc{Update: func(SyncObserverRef, uint64) (SyncPacket, error) {
+			return SyncPacket{Body: "manual"}, nil
+		}},
+	})
+	if _, ok := ent.Sync().AddObserverRef(NewPlayerSyncObserver(211)); !ok {
+		t.Fatal("AddObserverRef should succeed")
+	}
+	if err := WithGuardScope("manual_sync", func(scope *GuardScope) error {
+		if !scope.Guard().RequireEntity(ent) {
+			t.Fatal("RequireEntity should succeed")
+		}
+		ent.MarkSyncDirty(1)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.marked != 0 || len(scheduler.packets) != 0 {
+		t.Fatalf("manual dirty should not auto-flush: marked=%d packets=%+v", scheduler.marked, scheduler.packets)
+	}
+	if packets := ent.FlushSyncNow(); len(packets) != 1 || packets[0].Body != "manual" {
+		t.Fatalf("explicit flush packets=%+v", packets)
+	}
+}
+
+func TestEntitySyncRequestFlushDefersUntilGuardRelease(t *testing.T) {
+	oldScheduler := GetEntitySyncScheduler()
+	defer SetEntitySyncScheduler(oldScheduler)
+	scheduler := &testSyncScheduler{}
+	SetEntitySyncScheduler(scheduler)
+
+	id := mustBuildTestEntityID(t, 112, EntityCategory(1), EntityKind(2))
+	ent := &factoryTestEntity{EntityBase: NewEntityBase(id, EntityCategory(1), false, EntityKind(2))}
+	ent.EnableSync(EntitySyncCreateParam{Enabled: true, Topic: "manual", FlushPolicy: SyncFlushManual})
+	if err := WithGuardScope("request_sync_flush", func(scope *GuardScope) error {
+		if !scope.Guard().RequireEntity(ent) {
+			t.Fatal("RequireEntity should succeed")
+		}
+		ent.MarkSyncDirty(1)
+		ent.RequestSyncFlush()
+		if scheduler.marked != 0 {
+			t.Fatalf("scheduler should not be touched while entity is locked, marked=%d", scheduler.marked)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if scheduler.marked != 1 {
+		t.Fatalf("RequestSyncFlush should register after guard release, marked=%d", scheduler.marked)
+	}
+}
+
 type observedSyncMutex struct {
 	mu       sync.Mutex
 	id       int64
@@ -511,8 +603,9 @@ func TestEntitySyncGuardReleaseFlushesToScheduler(t *testing.T) {
 	scheduler := &testSyncScheduler{}
 	SetEntitySyncScheduler(scheduler)
 	ent.EnableSync(EntitySyncCreateParam{
-		Enabled: true,
-		Topic:   "release",
+		Enabled:     true,
+		Topic:       "release",
+		FlushPolicy: SyncFlushOnEntityRelease,
 		Packer: EntitySyncPackFunc{
 			Update: func(observer SyncObserverRef, mask uint64) (SyncPacket, error) {
 				if !mu.Held() {

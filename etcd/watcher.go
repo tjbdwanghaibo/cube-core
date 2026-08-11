@@ -9,6 +9,20 @@ type IWatcher interface {
 	Close() error
 }
 
+// IWatcherError is optionally implemented by watchers that can report why
+// their event channel closed. In particular, callers can distinguish a normal
+// close from an etcd cancellation or a compacted start revision without
+// breaking existing IWatcher implementations.
+type IWatcherError interface {
+	WatchError() error
+}
+
+// IWatcherReady is optionally implemented by watchers that can report when
+// the server has acknowledged creation of the watch stream.
+type IWatcherReady interface {
+	Ready() <-chan struct{}
+}
+
 // WatchEvent represents a key change event.
 type WatchEvent struct {
 	Type   EventType
@@ -28,4 +42,5 @@ const (
 type WatchOption struct {
 	WithPrevKV   bool  // include previous value in events
 	WithRevision int64 // start watching from revision (0 = current)
+	CreatedNotify bool  // notify when the server has established the watch
 }

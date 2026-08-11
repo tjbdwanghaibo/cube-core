@@ -15,6 +15,7 @@ const DefaultSchedulerInterval = 50 * time.Millisecond
 // a coalescing sink. It lets non-scene entities share the same sync delivery path.
 type Scheduler struct {
 	mu        sync.Mutex
+	flushMu   sync.Mutex
 	dirty     map[*entity.EntitySyncState]struct{}
 	coalescer *CoalescingSink
 	stop      chan struct{}
@@ -64,6 +65,8 @@ func (s *Scheduler) Flush() []entity.SyncPacket {
 	if s == nil {
 		return nil
 	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
 	states := s.takeDirtyStates()
 	for _, state := range states {
 		packets := state.Flush()

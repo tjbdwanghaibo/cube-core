@@ -2,8 +2,8 @@ package entitysync
 
 import (
 	"context"
-	"github.com/tjbdwanghaibo/cube-core/entity"
 	"errors"
+	"github.com/tjbdwanghaibo/cube-core/entity"
 	"testing"
 	"time"
 )
@@ -18,8 +18,9 @@ func TestSchedulerFlushesDirtyEntityState(t *testing.T) {
 
 	base := entity.NewEntityBase(104, entity.EntityCategory(1), false, entity.EntityKind(2))
 	base.EnableSync(entity.EntitySyncCreateParam{
-		Enabled: true,
-		Topic:   "alliance",
+		Enabled:     true,
+		Topic:       "alliance",
+		FlushPolicy: entity.SyncFlushInterval,
 		Packer: entity.EntitySyncPackFunc{
 			Update: func(observer entity.SyncObserverRef, mask uint64) (entity.SyncPacket, error) {
 				return entity.SyncPacket{Body: "delta", Mask: mask}, nil
@@ -52,8 +53,9 @@ func TestSchedulerAllowsNonSceneTopicEnterAndDelta(t *testing.T) {
 
 	base := entity.NewEntityBase(105, entity.EntityCategory(1), false, entity.EntityKind(2))
 	base.EnableSync(entity.EntitySyncCreateParam{
-		Enabled: true,
-		Topic:   "alliance",
+		Enabled:     true,
+		Topic:       "alliance",
+		FlushPolicy: entity.SyncFlushInterval,
 		Packer: entity.EntitySyncPackFunc{
 			Enter: func(observer entity.SyncObserverRef) (entity.SyncPacket, error) {
 				return entity.SyncPacket{Body: "alliance-full"}, nil
@@ -101,6 +103,7 @@ func TestSchedulerKeepsDirtyStateWhenMinIntervalDefersFlush(t *testing.T) {
 		Enabled:     true,
 		Topic:       "interval",
 		MinInterval: time.Hour,
+		FlushPolicy: entity.SyncFlushInterval,
 	})
 	if _, ok := base.Sync().AddObserverRef(entity.NewPlayerSyncObserver(403)); !ok {
 		t.Fatal("observer should be added")

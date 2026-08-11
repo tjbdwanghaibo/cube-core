@@ -1,9 +1,9 @@
 package entity
 
 import (
+	"fmt"
 	"github.com/tjbdwanghaibo/cube-core/event"
 	"github.com/tjbdwanghaibo/cube-core/lock"
-	"fmt"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -38,6 +38,7 @@ type EntityBase struct {
 
 	// Event bus for pub/sub capability.
 	eventBus *event.EventBus
+	syncMu   sync.RWMutex
 	sync     *EntitySyncState
 
 	// Lifecycle hooks — set by generated entity factory code.
@@ -107,58 +108,102 @@ func (e *EntityBase) EnableSync(param EntitySyncCreateParam) {
 		return
 	}
 	if !param.Enabled {
-		e.sync = nil
+		e.SetSyncState(nil)
 		return
 	}
 	if param.EntityID == 0 {
 		param.EntityID = e.id
 	}
-	param.Packer = newLockedEntitySyncPacker(e, param.Packer)
-	e.sync = NewEntitySyncState(param)
+	syncState := NewEntitySyncState(param)
+	e.SetSyncState(syncState)
 }
 
 func (e *EntityBase) SetSyncState(syncState *EntitySyncState) {
 	if e == nil {
 		return
 	}
+	e.syncMu.Lock()
+	previous := e.sync
+	if previous == syncState {
+		e.syncMu.Unlock()
+		return
+	}
+	if syncState != nil {
+		syncState.setPackerWrapper(func(packer EntitySyncPacker) EntitySyncPacker {
+			return newLockedEntitySyncPacker(e, packer)
+		})
+	}
 	e.sync = syncState
+	e.syncMu.Unlock()
+	if previous != nil && previous != syncState {
+		previous.Close()
+	}
 }
 
 func (e *EntityBase) Sync() *EntitySyncState {
 	if e == nil {
 		return nil
 	}
+	e.syncMu.RLock()
+	defer e.syncMu.RUnlock()
 	return e.sync
 }
 
 func (e *EntityBase) SyncEnabled() bool {
-	return e != nil && e.sync != nil && e.sync.Enabled()
+	if syncState := e.Sync(); syncState != nil {
+		return syncState.Enabled()
+	}
+	return false
 }
 
 func (e *EntityBase) MarkSyncDirty(mask uint64) {
-	if e != nil && e.sync != nil {
-		e.sync.MarkDirty(mask)
+	if syncState := e.Sync(); syncState != nil {
+		syncState.MarkDirty(mask)
 	}
 }
 
 func (e *EntityBase) MarkSyncFullDirty(reason uint32) {
-	if e != nil && e.sync != nil {
-		e.sync.MarkFullDirty(reason)
+	if syncState := e.Sync(); syncState != nil {
+		syncState.MarkFullDirty(reason)
 	}
 }
 
 func (e *EntityBase) FlushSync() []SyncPacket {
-	if e == nil || e.sync == nil {
-		return nil
+	if syncState := e.Sync(); syncState != nil {
+		return syncState.Flush()
 	}
-	return e.sync.Flush()
+	return nil
 }
 
 func (e *EntityBase) FlushSyncTo(sink EntitySyncSink) []SyncPacket {
-	if e == nil || e.sync == nil {
-		return nil
+	if syncState := e.Sync(); syncState != nil {
+		return syncState.FlushTo(sink)
 	}
-	return e.sync.FlushTo(sink)
+	return nil
+}
+
+// FlushSyncNow bypasses the configured minimum interval while preserving
+// stream serialization and entity-lock protected packing.
+func (e *EntityBase) FlushSyncNow() []SyncPacket {
+	if syncState := e.Sync(); syncState != nil {
+		return syncState.FlushNow()
+	}
+	return nil
+}
+
+func (e *EntityBase) FlushSyncNowTo(sink EntitySyncSink) []SyncPacket {
+	if syncState := e.Sync(); syncState != nil {
+		return syncState.FlushNowTo(sink)
+	}
+	return nil
+}
+
+// RequestSyncFlush schedules this entity for a post-release asynchronous
+// flush. Business handlers need not manage the entity mutex.
+func (e *EntityBase) RequestSyncFlush() {
+	if syncState := e.Sync(); syncState != nil {
+		syncState.RequestFlush()
+	}
 }
 
 // --- Identity ---
@@ -328,7 +373,13 @@ func (e *EntityBase) doClear() {
 		e.eventBus.Destroy()
 		e.eventBus = nil
 	}
+	e.syncMu.Lock()
+	syncState := e.sync
 	e.sync = nil
+	e.syncMu.Unlock()
+	if syncState != nil {
+		syncState.Close()
+	}
 	e.id = 0
 	e.category = EntityCategoryNone
 	e.kind = EntityKindNone

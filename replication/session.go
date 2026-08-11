@@ -1,0 +1,170 @@
+package replication
+
+import "sync"
+
+type SessionState struct {
+	mu          sync.Mutex
+	info        SessionInfo
+	ackTick     uint32
+	lastSent    uint32
+	sequence    uint32
+	forceFull   bool
+	closed      bool
+	qualityTier uint8
+	sent        map[uint32]Snapshot
+	sentOrder   []uint32
+	maxHistory  int
+}
+
+func NewSessionState(info SessionInfo) (*SessionState, error) {
+	if info.ID == 0 {
+		return nil, ErrSessionNotFound
+	}
+	return &SessionState{info: info, forceFull: true, sent: make(map[uint32]Snapshot), maxHistory: 64}, nil
+}
+
+func (s *SessionState) Info() SessionInfo {
+	if s == nil {
+		return SessionInfo{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.info
+}
+
+func (s *SessionState) Acknowledge(tick, latestPublished uint32) error {
+	if s == nil {
+		return ErrSessionNotFound
+	}
+	if tick == 0 || tick > latestPublished {
+		return ErrInvalidAck
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrSessionNotFound
+	}
+	if tick > s.lastSent {
+		return ErrInvalidAck
+	}
+	if _, ok := s.sent[tick]; !ok {
+		return ErrInvalidAck
+	}
+	if tick > s.ackTick {
+		s.ackTick = tick
+		s.forceFull = false
+	}
+	return nil
+}
+
+func (s *SessionState) ForceFull() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if !s.closed {
+		s.forceFull = true
+	}
+	s.mu.Unlock()
+}
+
+func (s *SessionState) SetQualityTier(tier uint8) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.qualityTier = tier
+	s.mu.Unlock()
+}
+
+func (s *SessionState) QualityTier() uint8 {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.qualityTier
+}
+
+func (s *SessionState) prepare(targetTick uint32) (SessionInfo, *Snapshot, uint32, error) {
+	if s == nil {
+		return SessionInfo{}, nil, 0, ErrSessionNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return SessionInfo{}, nil, 0, ErrSessionNotFound
+	}
+	s.sequence++
+	if s.sequence == 0 {
+		s.sequence++
+	}
+	if !s.forceFull && s.ackTick != 0 && s.ackTick < targetTick {
+		if base, ok := s.sent[s.ackTick]; ok {
+			base = base.Clone()
+			return s.info, &base, s.sequence, nil
+		}
+		s.forceFull = true
+	}
+	return s.info, nil, s.sequence, nil
+}
+
+func (s *SessionState) markSent(snapshot Snapshot, full bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
+	}
+	if snapshot.Tick > s.lastSent {
+		s.lastSent = snapshot.Tick
+	}
+	if _, exists := s.sent[snapshot.Tick]; !exists {
+		s.sentOrder = append(s.sentOrder, snapshot.Tick)
+	}
+	s.sent[snapshot.Tick] = snapshot.Clone()
+	for len(s.sentOrder) > s.maxHistory {
+		oldest := s.sentOrder[0]
+		s.sentOrder = s.sentOrder[1:]
+		delete(s.sent, oldest)
+	}
+	if full {
+		s.forceFull = false
+	}
+	s.mu.Unlock()
+}
+
+func (s *SessionState) Close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.closed = true
+	clear(s.sent)
+	s.sentOrder = nil
+	s.mu.Unlock()
+}
+
+type SessionSnapshot struct {
+	Info        SessionInfo
+	AckTick     uint32
+	LastSent    uint32
+	Sequence    uint32
+	ForceFull   bool
+	Closed      bool
+	QualityTier uint8
+}
+
+func (s *SessionState) Snapshot() SessionSnapshot {
+	if s == nil {
+		return SessionSnapshot{}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return SessionSnapshot{
+		Info: s.info, AckTick: s.ackTick, LastSent: s.lastSent, Sequence: s.sequence,
+		ForceFull: s.forceFull, Closed: s.closed, QualityTier: s.qualityTier,
+	}
+}

@@ -155,7 +155,7 @@ func releaseGuardScope(scope *GuardScope) {
 		return
 	}
 	guard := scope.guard
-	doGuardRelease(guard)
+	callbacks := guard.releaseEntities()
 	if scope.prev != nil {
 		storeGuardScope(scope.prev)
 	} else {
@@ -163,6 +163,9 @@ func releaseGuardScope(scope *GuardScope) {
 	}
 	scope.guard = nil
 	scope.prev = nil
+	guard.runPostRelease(callbacks)
+	guard.clean()
+	guardPool.Put(guard)
 }
 
 // GetEntityGuard returns the EntityGuard for the current entity guard scope.
@@ -187,12 +190,6 @@ func EntityGuardRelease(guard *EntityGuard) {
 	doGuardReleaseInCurrentGoroutine(guard)
 }
 
-func doGuardRelease(guard *EntityGuard) {
-	guard.ReleaseAll()
-	guard.clean()
-	guardPool.Put(guard)
-}
-
 func doGuardReleaseInCurrentGoroutine(guard *EntityGuard) {
 	prev := CurrentGuardScope()
 	temp := &GuardScope{
@@ -201,16 +198,7 @@ func doGuardReleaseInCurrentGoroutine(guard *EntityGuard) {
 		prev:  prev,
 	}
 	storeGuardScope(temp)
-	defer func() {
-		if prev != nil {
-			storeGuardScope(prev)
-		} else {
-			guardScopes.Delete(misc.GoID())
-		}
-		temp.guard = nil
-		temp.prev = nil
-	}()
-	doGuardRelease(guard)
+	releaseGuardScope(temp)
 }
 
 func newEntityGuard() *EntityGuard {
@@ -297,11 +285,20 @@ func (e *EntityGuard) ReleaseEntity(id int64) {
 }
 
 func (e *EntityGuard) ReleaseAll() {
+	callbacks := e.releaseEntities()
+	e.runPostRelease(callbacks)
+}
+
+func (e *EntityGuard) releaseEntities() []func() {
 	for _, ent := range e.eMap {
 		e.safeReleaseEntity(ent)
 	}
 	callbacks := e.postRelease
 	e.postRelease = nil
+	return callbacks
+}
+
+func (e *EntityGuard) runPostRelease(callbacks []func()) {
 	for _, f := range callbacks {
 		if f != nil {
 			func() {
