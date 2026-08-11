@@ -166,6 +166,37 @@ func TestEntityGuardReleaseAllPostReleaseIdempotent(t *testing.T) {
 	}
 }
 
+func TestEntityGuardPostReleaseRunsOutsideReleasedScope(t *testing.T) {
+	e := newTestEntity(11, testEntityCategoryPlayer)
+	run := false
+	err := WithGuardScope("post_release_scope", func(scope *GuardScope) error {
+		if !scope.Guard().RequireEntity(e) {
+			t.Fatal("RequireEntity should succeed")
+		}
+		scope.Guard().AppendPostRelease(func() {
+			run = true
+			if CurrentGuardScope() != nil {
+				t.Fatal("post-release callback must not inherit the released guard scope")
+			}
+			if err := WithGuardScope("post_release_reacquire", func(next *GuardScope) error {
+				if !next.Guard().RequireEntity(e) {
+					t.Fatal("post-release callback should be able to reacquire entity")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !run {
+		t.Fatal("post-release callback should run")
+	}
+}
+
 func TestBuildResolveEntityID(t *testing.T) {
 	rawID := int64(12345)
 	entityCategory := testEntityCategoryPlayer

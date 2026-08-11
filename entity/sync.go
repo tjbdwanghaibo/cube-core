@@ -17,9 +17,15 @@ const (
 type SyncFlushPolicy uint8
 
 const (
+	// SyncFlushManual only records dirty state. Call RequestFlush or FlushNow
+	// when the application decides that the state should be delivered.
 	SyncFlushManual SyncFlushPolicy = iota
+	// SyncFlushOnEntityRelease emits once the current entity guard has released
+	// its mutex. This is the default for generated gameplay entities.
 	SyncFlushOnEntityRelease
+	// SyncFlushInterval coalesces dirty state through the shared scheduler.
 	SyncFlushInterval
+	// SyncFlushImmediate queues a packet as soon as a state becomes dirty.
 	SyncFlushImmediate
 )
 
@@ -289,6 +295,7 @@ type EntitySyncObserver struct {
 
 type EntitySyncState struct {
 	mu              sync.Mutex
+	emitMu          sync.Mutex
 	enabled         bool
 	entityID        int64
 	topic           string
@@ -304,6 +311,7 @@ type EntitySyncState struct {
 	fullSyncOnDirty bool
 	observers       map[SyncObserverRef]EntitySyncObserver
 	packer          EntitySyncPacker
+	packerWrapper   func(EntitySyncPacker) EntitySyncPacker
 	packCacheConf   EntitySyncPackCacheConfig
 	packCache       map[syncPackCacheKey]SyncPacket
 }
@@ -394,7 +402,12 @@ func NewEntitySyncState(param EntitySyncCreateParam) *EntitySyncState {
 }
 
 func (s *EntitySyncState) Enabled() bool {
-	return s != nil && s.enabled
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.enabled
 }
 
 func (s *EntitySyncState) EntityID() int64 {
@@ -429,9 +442,49 @@ func (s *EntitySyncState) SetPacker(packer EntitySyncPacker) {
 		return
 	}
 	s.mu.Lock()
-	s.packer = packer
+	s.packer = s.wrapPackerLocked(packer)
 	s.clearPackCacheLocked()
 	s.mu.Unlock()
+}
+
+// setPackerWrapper binds an EntitySyncState to its owning entity. It is only
+// called by EntityBase; every later SetPacker call is wrapped as well, so
+// application code cannot accidentally bypass the entity mutex.
+func (s *EntitySyncState) setPackerWrapper(wrapper func(EntitySyncPacker) EntitySyncPacker) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.packerWrapper = wrapper
+	s.packer = s.wrapPackerLocked(s.packer)
+	s.clearPackCacheLocked()
+	s.mu.Unlock()
+}
+
+func (s *EntitySyncState) wrapPackerLocked(packer EntitySyncPacker) EntitySyncPacker {
+	if packer != nil && s.packerWrapper != nil {
+		return s.packerWrapper(packer)
+	}
+	return packer
+}
+
+// Close prevents queued or concurrent sync work from packing an entity after
+// its lifecycle has ended. It is idempotent.
+func (s *EntitySyncState) Close() {
+	if s == nil {
+		return
+	}
+	s.emitMu.Lock()
+	s.mu.Lock()
+	s.enabled = false
+	s.dirtyMask = 0
+	s.fullDirty = false
+	s.fullReason = SyncFullReasonNone
+	s.observers = nil
+	s.packer = nil
+	s.clearPackCacheLocked()
+	s.mu.Unlock()
+	s.emitMu.Unlock()
 }
 
 func (s *EntitySyncState) SetPackCache(config EntitySyncPackCacheConfig) {
@@ -449,6 +502,8 @@ func (s *EntitySyncState) AddObserverRef(ref SyncObserverRef) (SyncPacket, bool)
 	if s == nil || ref.Empty() {
 		return SyncPacket{}, false
 	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
 	s.mu.Lock()
 	if !s.enabled {
 		s.mu.Unlock()
@@ -472,6 +527,8 @@ func (s *EntitySyncState) TryAddObserverRefFromCachedEnter(ref SyncObserverRef) 
 	if s == nil || ref.Empty() {
 		return SyncPacket{}, false
 	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
 	s.mu.Lock()
 	if !s.enabled {
 		s.mu.Unlock()
@@ -501,6 +558,8 @@ func (s *EntitySyncState) RemoveObserverRef(ref SyncObserverRef) (SyncPacket, bo
 	if s == nil || ref.Empty() {
 		return SyncPacket{}, false
 	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
 	s.mu.Lock()
 	if !s.enabled {
 		s.mu.Unlock()
@@ -564,13 +623,20 @@ func (s *EntitySyncState) MarkDirty(mask uint64) {
 			marked = true
 		}
 	}
-	flushNow := s.enabled && s.flushPolicy == SyncFlushImmediate && GetEntitySyncSink() != nil
+	policy := s.flushPolicy
 	s.mu.Unlock()
-	if marked {
-		scheduleEntitySyncDirty(s, entityID)
+	if !marked {
+		return
 	}
-	if flushNow {
-		s.FlushToSink()
+	switch policy {
+	case SyncFlushInterval:
+		scheduleEntitySyncDirty(s, entityID)
+	case SyncFlushOnEntityRelease:
+		if !entitySyncLockedInCurrentGuard(entityID) {
+			scheduleEntitySyncDirty(s, entityID)
+		}
+	case SyncFlushImmediate:
+		s.flushAndEnqueue(true)
 	}
 }
 
@@ -593,13 +659,36 @@ func (s *EntitySyncState) MarkFullDirty(reason uint32) {
 		s.dirtyMask = 0
 		marked = true
 	}
-	flushNow := s.enabled && s.flushPolicy == SyncFlushImmediate && GetEntitySyncSink() != nil
+	policy := s.flushPolicy
 	s.mu.Unlock()
-	if marked {
-		scheduleEntitySyncDirty(s, entityID)
+	if !marked {
+		return
 	}
-	if flushNow {
-		s.FlushToSink()
+	switch policy {
+	case SyncFlushInterval:
+		scheduleEntitySyncDirty(s, entityID)
+	case SyncFlushOnEntityRelease:
+		if !entitySyncLockedInCurrentGuard(entityID) {
+			scheduleEntitySyncDirty(s, entityID)
+		}
+	case SyncFlushImmediate:
+		s.flushAndEnqueue(true)
+	}
+}
+
+// RequestFlush schedules a dirty state for asynchronous delivery regardless of
+// its configured automatic policy. It is safe to call inside an entity guard;
+// the scheduler registration is deferred until that guard releases the lock.
+func (s *EntitySyncState) RequestFlush() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	enabled := s.enabled
+	entityID := s.entityID
+	s.mu.Unlock()
+	if enabled {
+		scheduleEntitySyncDirty(s, entityID)
 	}
 }
 
@@ -648,6 +737,8 @@ func (s *EntitySyncState) PackFullForObserver(ref SyncObserverRef, reason uint32
 	if reason == SyncFullReasonNone {
 		reason = SyncFullReasonResync
 	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
 	s.mu.Lock()
 	if !s.enabled {
 		s.mu.Unlock()
@@ -670,6 +761,12 @@ func (s *EntitySyncState) flush(ignoreMinInterval bool) []SyncPacket {
 	if s == nil {
 		return nil
 	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	return s.flushLockedEmit(ignoreMinInterval)
+}
+
+func (s *EntitySyncState) flushLockedEmit(ignoreMinInterval bool) []SyncPacket {
 	now := fctx.Now()
 	s.mu.Lock()
 	if !s.enabled || (s.dirtyMask == 0 && !s.fullDirty) {
@@ -717,18 +814,59 @@ func (s *EntitySyncState) flush(ignoreMinInterval bool) []SyncPacket {
 }
 
 func (s *EntitySyncState) FlushTo(sink EntitySyncSink) []SyncPacket {
-	packets := s.Flush()
-	if len(packets) == 0 {
+	return s.flushTo(false, sink)
+}
+
+func (s *EntitySyncState) FlushToSink() []SyncPacket {
+	return s.FlushTo(GetEntitySyncSink())
+}
+
+// FlushNow bypasses MinInterval while preserving entity packing and stream
+// serialization. It is intended for explicit, critical refresh points.
+func (s *EntitySyncState) FlushNow() []SyncPacket {
+	return s.flush(true)
+}
+
+func (s *EntitySyncState) FlushNowTo(sink EntitySyncSink) []SyncPacket {
+	return s.flushTo(true, sink)
+}
+
+func (s *EntitySyncState) flushTo(ignoreMinInterval bool, sink EntitySyncSink) []SyncPacket {
+	if s == nil {
 		return nil
 	}
-	if sink != nil {
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	packets := s.flushLockedEmit(ignoreMinInterval)
+	if len(packets) > 0 && sink != nil {
 		sink.EnqueueBatch(packets)
 	}
 	return packets
 }
 
-func (s *EntitySyncState) FlushToSink() []SyncPacket {
-	return s.FlushTo(GetEntitySyncSink())
+func (s *EntitySyncState) flushAndEnqueue(ignoreMinInterval bool) []SyncPacket {
+	if s == nil {
+		return nil
+	}
+	s.emitMu.Lock()
+	defer s.emitMu.Unlock()
+	packets := s.flushLockedEmit(ignoreMinInterval)
+	enqueueEntitySyncPackets(packets)
+	return packets
+}
+
+func (s *EntitySyncState) flushOnEntityRelease() []SyncPacket {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	policy := s.flushPolicy
+	enabled := s.enabled
+	s.mu.Unlock()
+	if !enabled || policy != SyncFlushOnEntityRelease {
+		return nil
+	}
+	return s.flushAndEnqueue(true)
 }
 
 func (s *EntitySyncState) snapshotLocked() syncPackSnapshot {
@@ -966,29 +1104,47 @@ func init() {
 }
 
 func flushEntitySyncOnRelease(ent IThreadSafeEntity) {
-	scheduler := GetEntitySyncScheduler()
-	if scheduler == nil || ent == nil || ent.Base() == nil {
+	if ent == nil || ent.Base() == nil {
 		return
 	}
 	syncState := ent.Base().Sync()
 	if syncState == nil {
 		return
 	}
-	packets := syncState.flush(true)
-	if len(packets) > 0 {
-		scheduler.EnqueueBatch(packets)
-	}
+	syncState.flushOnEntityRelease()
 }
 
 func scheduleEntitySyncDirty(state *EntitySyncState, entityID int64) {
-	scheduler := GetEntitySyncScheduler()
-	if scheduler == nil {
+	if state == nil {
 		return
 	}
 	if entitySyncLockedInCurrentGuard(entityID) {
+		scope := CurrentGuardScope()
+		if scope != nil && scope.Guard() != nil {
+			scope.Guard().AppendPostRelease(func() {
+				if scheduler := GetEntitySyncScheduler(); scheduler != nil {
+					scheduler.MarkDirtyState(state)
+				}
+			})
+		}
 		return
 	}
-	scheduler.MarkDirtyState(state)
+	if scheduler := GetEntitySyncScheduler(); scheduler != nil {
+		scheduler.MarkDirtyState(state)
+	}
+}
+
+func enqueueEntitySyncPackets(packets []SyncPacket) {
+	if len(packets) == 0 {
+		return
+	}
+	if scheduler := GetEntitySyncScheduler(); scheduler != nil {
+		scheduler.EnqueueBatch(packets)
+		return
+	}
+	if sink := GetEntitySyncSink(); sink != nil {
+		sink.EnqueueBatch(packets)
+	}
 }
 
 func entitySyncLockedInCurrentGuard(entityID int64) bool {
