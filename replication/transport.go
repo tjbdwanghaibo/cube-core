@@ -44,6 +44,25 @@ type Projector interface {
 	Project(SessionInfo, Snapshot) (Snapshot, error)
 }
 
+// ProjectionContext supplies optional per-session state to projectors without
+// changing the stable Projector interface. Previous is the exact projection
+// most recently admitted for this session, not the canonical room snapshot.
+// Current is populated by composed projectors such as LODProjector and must be
+// treated as read-only.
+type ProjectionContext struct {
+	Session     SessionInfo
+	QualityTier uint8
+	Previous    *Snapshot
+	Current     *Snapshot
+	FullRefresh bool
+}
+
+// ContextProjector can preserve previously projected values while applying
+// per-session frequency limits. Replicator prefers it over Projector.Project.
+type ContextProjector interface {
+	ProjectWithContext(ProjectionContext, Snapshot) (Snapshot, error)
+}
+
 type ProjectorFunc func(SessionInfo, Snapshot) (Snapshot, error)
 
 func (f ProjectorFunc) Project(session SessionInfo, snapshot Snapshot) (Snapshot, error) {

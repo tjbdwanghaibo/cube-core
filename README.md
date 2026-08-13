@@ -104,6 +104,18 @@ log:
 
 `health`、`obs` 和 `admin` 在 `app.Registry` 创建时即注册。具体 Mod 应在 `Start` 阶段把外部依赖的健康检查和指标接入这些能力。
 
+### 实时复制 LOD
+
+`replication.LODProjector` 在不可变 Snapshot 上执行 per-session Object LOD，不读取或锁定业务 Entity。它支持：
+
+- 八个细节等级和 `LODCulled` 对象裁剪。
+- 按组件 LOD mask、优先级和最大更新频率裁剪数据。
+- 非采样帧沿用该 Session 上次已发送的组件值，避免产生错误的 ComponentRemove。
+- 网络质量档位、当前投影、上一投影和 Full Resync 上下文。
+- 对象裁剪、组件省略、组件降频保持等原子统计。
+
+可见性 Projector 应作为 `LODProjectorConfig.Upstream`，先消除客户端无权得知的数据，再执行距离和质量降级。业务只负责返回 LOD 决策，基线、Delta、恢复和并发安全由 replication 底层处理。
+
 ### 开发与验证
 
 ```bash

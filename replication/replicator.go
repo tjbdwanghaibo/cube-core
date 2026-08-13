@@ -41,6 +41,7 @@ type replicatorCounters struct {
 	sendErrors   atomic.Uint64
 	invalidAcks  atomic.Uint64
 	forcedFull   atomic.Uint64
+	qualitySet   atomic.Uint64
 	registered   atomic.Uint64
 	unregistered atomic.Uint64
 }
@@ -55,6 +56,7 @@ type ReplicatorStats struct {
 	SendErrors         uint64
 	InvalidAcks        uint64
 	ForcedFull         uint64
+	QualityTierChanges uint64
 	RegisteredSessions uint64
 	RemovedSessions    uint64
 	ActiveSessions     int
@@ -181,6 +183,25 @@ func (r *Replicator) ForceFull(id SessionID) error {
 	return nil
 }
 
+// SetQualityTier updates the network quality input consumed by a
+// ContextProjector. Tier meanings are application-defined and do not alter the
+// wire protocol. The next projection observes the new value immediately.
+func (r *Replicator) SetQualityTier(id SessionID, tier uint8) error {
+	if !r.begin() {
+		return ErrReplicatorClosed
+	}
+	defer r.active.Done()
+	state, err := r.session(id)
+	if err != nil {
+		return err
+	}
+	if err := state.SetQualityTier(tier); err != nil {
+		return err
+	}
+	r.stats.qualitySet.Add(1)
+	return nil
+}
+
 func (r *Replicator) BuildLatest(id SessionID) (DeltaFrame, [][]byte, error) {
 	if !r.begin() {
 		return DeltaFrame{}, nil, ErrReplicatorClosed
@@ -194,11 +215,13 @@ func (r *Replicator) BuildLatest(id SessionID) (DeltaFrame, [][]byte, error) {
 	if !ok {
 		return DeltaFrame{}, nil, ErrSnapshotNotFound
 	}
-	info, base, sequence, err := state.prepare(current.Tick)
+	info, qualityTier, base, previous, sequence, fullRefresh, err := state.prepare(current.Tick)
 	if err != nil {
 		return DeltaFrame{}, nil, err
 	}
-	current, err = r.projectAndNormalize(info, current)
+	current, err = r.projectAndNormalize(ProjectionContext{
+		Session: info, QualityTier: qualityTier, Previous: previous, FullRefresh: fullRefresh,
+	}, current)
 	if err != nil {
 		return DeltaFrame{}, nil, err
 	}
@@ -404,7 +427,7 @@ func (r *Replicator) Stats() ReplicatorStats {
 		DeltaFrames: r.stats.deltaFrames.Load(), Datagrams: r.stats.datagrams.Load(),
 		EncodedBytes: r.stats.encodedBytes.Load(), SentBytes: r.stats.sentBytes.Load(),
 		SendErrors: r.stats.sendErrors.Load(), InvalidAcks: r.stats.invalidAcks.Load(),
-		ForcedFull: r.stats.forcedFull.Load(), RegisteredSessions: r.stats.registered.Load(),
+		ForcedFull: r.stats.forcedFull.Load(), QualityTierChanges: r.stats.qualitySet.Load(), RegisteredSessions: r.stats.registered.Load(),
 		RemovedSessions: r.stats.unregistered.Load(), ActiveSessions: active, SnapshotsRetained: r.ring.Len(),
 	}
 }
@@ -474,11 +497,17 @@ func (r *Replicator) session(id SessionID) (*SessionState, error) {
 	return state, nil
 }
 
-func (r *Replicator) projectAndNormalize(info SessionInfo, snapshot Snapshot) (Snapshot, error) {
+func (r *Replicator) projectAndNormalize(projection ProjectionContext, snapshot Snapshot) (Snapshot, error) {
 	r.mu.RLock()
 	projector := r.projector
 	r.mu.RUnlock()
-	projected, err := projector.Project(info, snapshot.Clone())
+	var projected Snapshot
+	var err error
+	if contextual, ok := projector.(ContextProjector); ok {
+		projected, err = contextual.ProjectWithContext(projection, snapshot.Clone())
+	} else {
+		projected, err = projector.Project(projection.Session, snapshot.Clone())
+	}
 	if err != nil {
 		return Snapshot{}, err
 	}

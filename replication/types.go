@@ -30,6 +30,7 @@ var (
 	ErrTransportMissing   = errors.New("replication: transport is not configured")
 	ErrReplicatorClosed   = errors.New("replication: replicator is closed")
 	ErrSchemaFrozen       = errors.New("replication: schema configuration is frozen")
+	ErrInvalidLOD         = errors.New("replication: invalid level of detail configuration")
 )
 
 type Limits struct {

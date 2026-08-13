@@ -68,13 +68,17 @@ func (s *SessionState) ForceFull() {
 	s.mu.Unlock()
 }
 
-func (s *SessionState) SetQualityTier(tier uint8) {
+func (s *SessionState) SetQualityTier(tier uint8) error {
 	if s == nil {
-		return
+		return ErrSessionNotFound
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrSessionNotFound
+	}
 	s.qualityTier = tier
-	s.mu.Unlock()
+	return nil
 }
 
 func (s *SessionState) QualityTier() uint8 {
@@ -86,27 +90,32 @@ func (s *SessionState) QualityTier() uint8 {
 	return s.qualityTier
 }
 
-func (s *SessionState) prepare(targetTick uint32) (SessionInfo, *Snapshot, uint32, error) {
+func (s *SessionState) prepare(targetTick uint32) (SessionInfo, uint8, *Snapshot, *Snapshot, uint32, bool, error) {
 	if s == nil {
-		return SessionInfo{}, nil, 0, ErrSessionNotFound
+		return SessionInfo{}, 0, nil, nil, 0, false, ErrSessionNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return SessionInfo{}, nil, 0, ErrSessionNotFound
+		return SessionInfo{}, 0, nil, nil, 0, false, ErrSessionNotFound
 	}
 	s.sequence++
 	if s.sequence == 0 {
 		s.sequence++
 	}
+	var previous *Snapshot
+	if latest, ok := s.sent[s.lastSent]; ok {
+		clone := latest.Clone()
+		previous = &clone
+	}
 	if !s.forceFull && s.ackTick != 0 && s.ackTick < targetTick {
 		if base, ok := s.sent[s.ackTick]; ok {
 			base = base.Clone()
-			return s.info, &base, s.sequence, nil
+			return s.info, s.qualityTier, &base, previous, s.sequence, false, nil
 		}
 		s.forceFull = true
 	}
-	return s.info, nil, s.sequence, nil
+	return s.info, s.qualityTier, nil, previous, s.sequence, true, nil
 }
 
 func (s *SessionState) markSent(snapshot Snapshot, full bool) {
