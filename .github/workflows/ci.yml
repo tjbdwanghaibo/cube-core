@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go mod download
+      - run: go test ./...
+      - run: go vet ./...
+      - run: go test -race ./entity ./entitysync ./checkpoint ./replication ./app ./nest ./worker
+      - run: go test -run '^$' -bench BenchmarkRemoteSnapshotCacheL1Get4K -benchtime=1s ./entity
+
+  windows-compatibility:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./...
