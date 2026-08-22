@@ -1,6 +1,7 @@
 package entity
 
 import (
+	"context"
 	"fmt"
 	"github.com/tjbdwanghaibo/cube-core/checkpoint"
 	"github.com/tjbdwanghaibo/cube-core/lock"
@@ -46,8 +47,14 @@ type IThreadSafeEntityBase interface {
 
 // Getter retrieves entities by ID.
 type Getter interface {
-	Get(id int64, entityCategory EntityCategory) (IThreadSafeEntity, error)
-	GetMany(ids []int64, idCategories []EntityCategory) ([]IThreadSafeEntity, error)
+	Get(context.Context, int64, EntityCategory) (IThreadSafeEntity, error)
+	GetMany(context.Context, []int64, []EntityCategory) ([]IThreadSafeEntity, error)
+}
+
+// AggregateLoader reconstructs a complete entity from persistent DAO
+// documents and publishes it atomically through the owning EntityManager.
+type AggregateLoader interface {
+	LoadEntity(context.Context, int64, EntityKind) (IThreadSafeEntity, error)
 }
 
 // IDirty tracks modification state.
@@ -70,6 +77,13 @@ type DaoInterface interface {
 // resolved by the storage service.
 type DatabaseScopedDao interface {
 	DbScope() checkpoint.DatabaseScope
+}
+
+// PersistedDaoLoader is implemented by generated DAOs. RestorePersisted owns
+// schema migration, BSON decoding and dirty/version tracker restoration so the
+// storage layer never needs reflection or knowledge of generated fields.
+type PersistedDaoLoader interface {
+	RestorePersisted(raw []byte, schemaVersion uint32, version uint64) error
 }
 
 // Guardable is implemented by entities that expose DAO instances for
@@ -97,6 +111,12 @@ type EntityCreateParam struct {
 	Dao            map[string]DaoInterface
 	Sync           *EntitySyncCreateParam
 	Param          any
+	// Mutex is injected by the owning EntityManager. Generated constructors
+	// pass it into the entity base constructor.
+	Mutex lock.Mutex
+	// RemoteRestore is set only by the persistent aggregate repository. BuildEntity
+	// installs it before OnInitFinish and before the manager publishes the entity.
+	RemoteRestore *RemoteVersionVector
 }
 
 func (param *EntityCreateParam) NormalizeID(kind EntityKind) error {
@@ -131,14 +151,7 @@ func (param *EntityCreateParam) NormalizeID(kind EntityKind) error {
 	if !param.IsCreate {
 		return fmt.Errorf("entity load requires full Id or UniqueID")
 	}
-	if GenerateID == nil {
-		return fmt.Errorf("entity.GenerateID not set")
-	}
-	rawID, err := GenerateID()
-	if err != nil {
-		return fmt.Errorf("generate entity id: %w", err)
-	}
-	return param.setRawID(int64(rawID), kind)
+	return ErrIDGeneratorRequired
 }
 
 func (param *EntityCreateParam) setRawID(uniqueID int64, kind EntityKind) error {
@@ -190,6 +203,3 @@ func (param *EntityCreateParam) FullID() int64 {
 	}
 	return param.Id
 }
-
-// SendMsg is a hook set by the nest package to dispatch messages from entity context.
-var SendMsg func(msg any)

@@ -26,6 +26,7 @@ type Config struct {
 	SnapshotWALRequired       bool          // reject journal submission if snapshot WAL rejects the batch
 	SnapshotWALMode           SnapshotWALMode
 	SnapshotWALDurableTimeout time.Duration
+	LoadConcurrency           int // max collections loaded concurrently at one dependency level
 }
 
 func defaultConfig() Config {
@@ -39,6 +40,15 @@ func defaultConfig() Config {
 		RetryMaxBack:              5 * time.Second,
 		SnapshotWALMode:           SnapshotWALModeAsync,
 		SnapshotWALDurableTimeout: 20 * time.Millisecond,
+		LoadConcurrency:           4,
+	}
+}
+
+func WithLoadConcurrency(n int) Option {
+	return func(c *Config) {
+		if n > 0 {
+			c.LoadConcurrency = n
+		}
 	}
 }
 

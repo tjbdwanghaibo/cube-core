@@ -90,8 +90,8 @@ func TestDirtyTracker_Rollback(t *testing.T) {
 	mask := d.TakePersistDirty()
 
 	d.RollbackPersist(mask)
-	if d.PersistDirtyMask() != DirtyAll {
-		t.Fatal("should be dirty after rollback")
+	if d.PersistDirtyMask() != 1<<1 {
+		t.Fatal("should restore exactly the captured dirty mask")
 	}
 }
 
@@ -366,6 +366,101 @@ func TestCheckpoint_SubmitAndFlush(t *testing.T) {
 	}
 }
 
+func TestCheckpointActiveFlushDrainsWithoutStopping(t *testing.T) {
+	backend := &mockBackend{}
+	cp := New(backend, WithFlushWorkers(0))
+	if err := cp.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var dirty DirtyTracker
+	dirty.MarkPersist(1)
+	item := SaveItem{Collection: "players", ID: 301, Version: dirty.IncVersion(), Mask: dirty.TakePersistDirty(), Data: []byte("state"), Tracker: &dirty}
+	if !cp.Submit([]SaveItem{item}) {
+		t.Fatal("submit failed")
+	}
+	if err := cp.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if cp.Journal().Len() != 0 || len(backend.getSaved()) != 1 || dirty.Dirty() {
+		t.Fatalf("pending=%d saved=%d dirty=%v", cp.Journal().Len(), len(backend.getSaved()), dirty.Dirty())
+	}
+	if !cp.Running() {
+		t.Fatal("active flush must not stop checkpoint")
+	}
+	if err := cp.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type blockingBackend struct {
+	mockBackend
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingBackend) BulkSave(ctx context.Context, ops []SaveOp) ([]SaveResult, error) {
+	b.once.Do(func() { close(b.entered) })
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-b.release:
+		return b.mockBackend.BulkSave(ctx, ops)
+	}
+}
+
+func TestCheckpointActiveFlushWaitsForInFlightWorker(t *testing.T) {
+	backend := &blockingBackend{entered: make(chan struct{}), release: make(chan struct{})}
+	cp := New(backend, WithFlushWorkers(1), WithFlushInterval(time.Millisecond))
+	if err := cp.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !cp.Submit([]SaveItem{{Collection: "players", ID: 302, Version: 1, Data: []byte("state")}}) {
+		t.Fatal("submit failed")
+	}
+	<-backend.entered
+	flushed := make(chan error, 1)
+	go func() { flushed <- cp.Flush(context.Background()) }()
+	select {
+	case err := <-flushed:
+		t.Fatalf("flush returned before in-flight write: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(backend.release)
+	if err := <-flushed; err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCheckpointRequeuesPerItemBackendFailure(t *testing.T) {
+	backend := &mockBackend{results: []SaveResult{{Err: errors.New("rejected")}}}
+	cp := New(backend, WithFlushWorkers(0))
+	if err := cp.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !cp.Submit([]SaveItem{{Collection: "players", ID: 303, Version: 1, Data: []byte("state")}}) {
+		t.Fatal("submit failed")
+	}
+	if err := cp.Flush(context.Background()); err == nil {
+		t.Fatal("first flush must report the item failure")
+	}
+	if cp.Journal().Len() != 1 {
+		t.Fatalf("failed item was not requeued: pending=%d", cp.Journal().Len())
+	}
+	backend.mu.Lock()
+	backend.results = nil
+	backend.mu.Unlock()
+	if err := cp.Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := cp.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCheckpointSubmitForwardsToSnapshotWALAfterJournalPush(t *testing.T) {
 	wal := &fakeSnapshotWAL{}
 	cp := New(&mockBackend{}, WithSnapshotWAL(wal), WithFlushWorkers(0))
@@ -431,7 +526,7 @@ func TestCheckpointSubmitDurableSnapshotWALFailureSkipsJournalPush(t *testing.T)
 	}
 }
 
-func TestCheckpointSubmitUsesJournalSubmitTimeoutAfterDurableWAL(t *testing.T) {
+func TestCheckpointDurableWALRemainsAcceptedWhenLiveJournalIsFull(t *testing.T) {
 	wal := &fakeSnapshotWAL{}
 	cp := New(&mockBackend{},
 		WithJournalCap(1),
@@ -445,8 +540,8 @@ func TestCheckpointSubmitUsesJournalSubmitTimeoutAfterDurableWAL(t *testing.T) {
 		t.Fatal("initial journal push failed")
 	}
 
-	if ok := cp.Submit([]SaveItem{{Collection: "players", ID: 2, Version: 1, Data: []byte("two")}}); ok {
-		t.Fatal("Submit returned true when journal remained full past submit timeout")
+	if ok := cp.Submit([]SaveItem{{Collection: "players", ID: 2, Version: 1, Data: []byte("two")}}); !ok {
+		t.Fatal("durably admitted snapshot must remain accepted when the live journal is full")
 	}
 	if len(wal.durableSubmitted) != 1 {
 		t.Fatalf("durable wal submit count = %d, want 1", len(wal.durableSubmitted))
@@ -456,7 +551,7 @@ func TestCheckpointSubmitUsesJournalSubmitTimeoutAfterDurableWAL(t *testing.T) {
 	}
 }
 
-func TestCheckpointSubmitRemoveAcksSnapshotWAL(t *testing.T) {
+func TestCheckpointSubmitRemovePersistsDeleteTombstoneBeforeFlush(t *testing.T) {
 	wal := &fakeSnapshotWAL{}
 	cp := New(&mockBackend{}, WithSnapshotWAL(wal), WithFlushWorkers(0))
 
@@ -464,12 +559,15 @@ func TestCheckpointSubmitRemoveAcksSnapshotWAL(t *testing.T) {
 		t.Fatal("SubmitRemove returned false")
 	}
 
-	if len(wal.acked) != 1 {
-		t.Fatalf("wal ack batch count = %d, want 1", len(wal.acked))
+	if len(wal.deleted) != 1 {
+		t.Fatalf("wal delete batch count = %d, want 1", len(wal.deleted))
 	}
-	acked := wal.acked[0]
-	if len(acked) != 2 || acked[0].Collection != "players" || acked[0].ID != 1001 || acked[1].ID != 1002 {
-		t.Fatalf("wal acked removes = %+v", acked)
+	deleted := wal.deleted[0]
+	if len(deleted) != 2 || deleted[0].Collection != "players" || deleted[0].ID != 1001 || deleted[1].ID != 1002 {
+		t.Fatalf("wal delete tombstones = %+v", deleted)
+	}
+	if len(wal.acked) != 0 {
+		t.Fatalf("delete WAL was acked before backend removal: %+v", wal.acked)
 	}
 }
 
@@ -498,11 +596,12 @@ func TestCheckpointSubmitRemoveItemsPreservesDbForBackendAndWAL(t *testing.T) {
 	if op := backend.removed[0]; op.Fence != 9 || op.OwnerSid != 1001 || !op.Shared {
 		t.Fatalf("fenced remove metadata was not forwarded: %+v", op)
 	}
-	if len(wal.acked) == 0 || len(wal.acked[0]) != 2 {
-		t.Fatalf("wal acked = %+v, want two db-scoped items", wal.acked)
+	acked := make([]SaveItem, 0, 2)
+	for _, batch := range wal.acked {
+		acked = append(acked, batch...)
 	}
-	if wal.acked[0][0].Db != "game_1" || wal.acked[0][1].Db != "game_2" {
-		t.Fatalf("wal acked = %+v, want db game_1/game_2", wal.acked)
+	if len(acked) != 2 || acked[0].Db != "game_1" || acked[1].Db != "game_2" {
+		t.Fatalf("wal acked = %+v, want db game_1/game_2", acked)
 	}
 }
 
@@ -550,8 +649,8 @@ func TestFlusherAcksSnapshotWALAfterSuccessfulOrConflictedFlush(t *testing.T) {
 	}
 	cp.journal.Close()
 
-	if err := cp.flusher.FlushAll(context.Background()); err != nil {
-		t.Fatalf("FlushAll: %v", err)
+	if err := cp.flusher.FlushAll(context.Background()); err == nil {
+		t.Fatal("FlushAll must report the unpersisted bags item")
 	}
 
 	if len(wal.acked) != 1 {
@@ -615,6 +714,59 @@ func TestCheckpoint_Dedup(t *testing.T) {
 	}
 }
 
+func TestFlusherDedupSaveAfterRemoveRecreatesDocument(t *testing.T) {
+	cp := New(&mockBackend{})
+	saves, removes := cp.flusher.dedup([]JournalEntry{{Items: []SaveItem{
+		{Db: "game", Collection: "players", ID: 100, Version: 2, Data: []byte("old")},
+		{Db: "game", Collection: "players", ID: 100},
+		{Db: "game", Collection: "players", ID: 100, Version: 3, Data: []byte("new")},
+	}}})
+	if len(removes) != 0 {
+		t.Fatalf("save after remove must cancel tombstone, got %+v", removes)
+	}
+	if len(saves) != 1 || saves[0].Version != 3 || string(saves[0].Data) != "new" {
+		t.Fatalf("unexpected final save: %+v", saves)
+	}
+}
+
+func TestFreezeSaveItemsOwnsMutablePatchData(t *testing.T) {
+	values := []int{1, 2}
+	nested := map[string]any{"values": values}
+	items := freezeSaveItems([]SaveItem{{
+		Collection: "players", ID: 100, Version: 1, Mode: SaveModePatch,
+		Data:  []byte("full"),
+		Patch: PersistPatch{Set: map[string]any{"inventory": nested}, FullData: []byte("fallback")},
+	}})
+	values[0] = 99
+	nested["late"] = true
+
+	got := items[0].Patch.Set["inventory"].(map[string]any)
+	gotValues := got["values"].([]int)
+	if gotValues[0] != 1 {
+		t.Fatalf("frozen patch aliases source slice: %+v", gotValues)
+	}
+	if _, exists := got["late"]; exists {
+		t.Fatalf("frozen patch aliases source map: %+v", got)
+	}
+	items[0].Data[0] = 'F'
+	if string(items[0].Patch.FullData) != "fallback" {
+		t.Fatalf("patch full fallback aliases save data: %q", items[0].Patch.FullData)
+	}
+}
+
+func TestCheckpointCannotRestartAfterStop(t *testing.T) {
+	cp := New(&mockBackend{}, WithFlushWorkers(0))
+	if err := cp.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if err := cp.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if err := cp.Start(context.Background()); !errors.Is(err, ErrCheckpointStopped) {
+		t.Fatalf("restart error = %v, want %v", err, ErrCheckpointStopped)
+	}
+}
+
 func TestCheckpoint_StopTimeoutRollsBackPending(t *testing.T) {
 	backend := &mockBackend{}
 	cp := New(backend, WithFlushWorkers(0))
@@ -634,7 +786,7 @@ func TestCheckpoint_StopTimeoutRollsBackPending(t *testing.T) {
 	if err := cp.Stop(stopCtx); err == nil {
 		t.Fatal("expected stop error")
 	}
-	if d.PersistDirtyMask() != DirtyAll {
+	if d.PersistDirtyMask() != mask {
 		t.Fatalf("pending dirty should be rolled back, got %d", d.PersistDirtyMask())
 	}
 }
@@ -642,6 +794,8 @@ func TestCheckpoint_StopTimeoutRollsBackPending(t *testing.T) {
 type fakeSnapshotWAL struct {
 	submitted        [][]SaveItem
 	durableSubmitted [][]SaveItem
+	deleted          [][]SaveItem
+	durableDeleted   [][]SaveItem
 	acked            [][]SaveItem
 	started          int
 	stopped          int
@@ -666,6 +820,16 @@ func (w *fakeSnapshotWAL) Submit(items []SaveItem) bool {
 
 func (w *fakeSnapshotWAL) SubmitDurable(_ context.Context, items []SaveItem) bool {
 	w.durableSubmitted = append(w.durableSubmitted, cloneSaveItemsForTest(items))
+	return !w.rejectDurable
+}
+
+func (w *fakeSnapshotWAL) SubmitDelete(items []SaveItem) bool {
+	w.deleted = append(w.deleted, cloneSaveItemsForTest(items))
+	return !w.rejectSubmit
+}
+
+func (w *fakeSnapshotWAL) SubmitDeleteDurable(_ context.Context, items []SaveItem) bool {
+	w.durableDeleted = append(w.durableDeleted, cloneSaveItemsForTest(items))
 	return !w.rejectDurable
 }
 
@@ -780,5 +944,15 @@ func TestLoader_Dependencies(t *testing.T) {
 	}
 	if order[0] != "players" {
 		t.Fatalf("expected players first, got %s", order[0])
+	}
+}
+
+func TestLoaderRejectsMissingBackendAndAcceptsNilContext(t *testing.T) {
+	if err := NewLoader(nil, nil).LoadAll(nil, []LoadTemplate{{Collection: "players"}}); !errors.Is(err, ErrCheckpointBackendRequired) {
+		t.Fatalf("missing backend error=%v", err)
+	}
+	backend := &mockBackend{}
+	if err := NewLoader(backend, nil).LoadAll(nil, []LoadTemplate{{Collection: "players"}}); err != nil {
+		t.Fatalf("nil context load: %v", err)
 	}
 }

@@ -1,12 +1,12 @@
 package entity
 
 import (
-	flog "github.com/tjbdwanghaibo/cube-core/log"
-	"github.com/tjbdwanghaibo/cube-core/misc"
 	"errors"
 	"fmt"
+	"github.com/tjbdwanghaibo/cube-core/lock"
+	flog "github.com/tjbdwanghaibo/cube-core/log"
+	"github.com/tjbdwanghaibo/cube-core/misc"
 	"sync"
-	"sync/atomic"
 )
 
 const defaultBucketCnt = 64
@@ -14,30 +14,80 @@ const defaultBucketCnt = 64
 // EntityManager is the central registry for all entities.
 // Uses sharded buckets for high-concurrency access with hundreds of thousands of entities.
 type EntityManager struct {
-	entities *misc.BucketHolder[int64, IThreadSafeEntity]
-	addMu    sync.Mutex
-	groupMu  sync.RWMutex
-	groups   map[int64]map[int64]IThreadSafeEntity
+	entities          *misc.BucketHolder[int64, IThreadSafeEntity]
+	idGen             func() (uint64, error)
+	locks             *lock.LockManager
+	configMu          sync.RWMutex
+	addMu             sync.Mutex
+	removing          map[int64]struct{}
+	groupMu           sync.RWMutex
+	groups            map[int64]map[int64]IThreadSafeEntity
+	hookMu            sync.RWMutex
+	nextHookID        uint64
+	releaseHooks      []entityReleaseHook
+	removeFromDBHooks []entityRemoveFromDBHook
 }
 
 var (
-	ErrEntityNil        = errors.New("entity manager: nil entity")
-	ErrEntityRemoved    = errors.New("entity manager: entity removed")
-	ErrEntityExists     = errors.New("entity manager: entity already exists")
-	ErrEntityNotManaged = errors.New("entity manager: entity not managed")
+	ErrEntityNil           = errors.New("entity manager: nil entity")
+	ErrEntityRemoved       = errors.New("entity manager: entity removed")
+	ErrEntityExists        = errors.New("entity manager: entity already exists")
+	ErrEntityNotManaged    = errors.New("entity manager: entity not managed")
+	ErrIDGeneratorRequired = errors.New("entity manager: id generator is required for new entities")
 )
 
 // NewEntityManager creates an EntityManager with default bucket count.
-func NewEntityManager() *EntityManager {
-	return NewEntityManagerWithBuckets(defaultBucketCnt)
+type EntityManagerOption func(*EntityManager)
+
+func WithEntityIDGenerator(generator func() (uint64, error)) EntityManagerOption {
+	return func(manager *EntityManager) {
+		manager.idGen = generator
+	}
+}
+
+func WithEntityLockManager(manager *lock.LockManager) EntityManagerOption {
+	return func(entityManager *EntityManager) {
+		entityManager.locks = manager
+	}
+}
+
+// ConfigureIDGenerator installs the instance generator before any entity is
+// published. It is safe against concurrent Create calls and refuses runtime
+// replacement once the manager contains state.
+func (m *EntityManager) ConfigureIDGenerator(generator func() (uint64, error)) error {
+	if m == nil || generator == nil {
+		return fmt.Errorf("entity manager: id generator is required")
+	}
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	if m.Len() != 0 {
+		return fmt.Errorf("entity manager: id generator cannot change after entity publication")
+	}
+	m.idGen = generator
+	return nil
+}
+
+func NewEntityManager(options ...EntityManagerOption) *EntityManager {
+	return NewEntityManagerWithBuckets(defaultBucketCnt, options...)
 }
 
 // NewEntityManagerWithBuckets creates an EntityManager with specified bucket count.
-func NewEntityManagerWithBuckets(bucketCnt int) *EntityManager {
-	return &EntityManager{
+func NewEntityManagerWithBuckets(bucketCnt int, options ...EntityManagerOption) *EntityManager {
+	manager := &EntityManager{
 		entities: misc.NewBucketHolder[int64, IThreadSafeEntity](bucketCnt, nil, false),
 		groups:   make(map[int64]map[int64]IThreadSafeEntity),
+		locks:    lock.NewLockManager(nil),
+		removing: make(map[int64]struct{}),
 	}
+	for _, option := range options {
+		if option != nil {
+			option(manager)
+		}
+	}
+	if manager.locks == nil {
+		manager.locks = lock.NewLockManager(nil)
+	}
+	return manager
 }
 
 // Add registers an entity. Panics on duplicate ID.
@@ -49,56 +99,55 @@ func (m *EntityManager) Add(e IThreadSafeEntity) {
 
 // TryAdd registers an entity and reports duplicate IDs as an error.
 func (m *EntityManager) TryAdd(e IThreadSafeEntity) error {
-	if e == nil {
+	if e == nil || e.Base() == nil {
 		return ErrEntityNil
 	}
 	id := e.ID()
 	m.addMu.Lock()
 	defer m.addMu.Unlock()
+	if _, removing := m.removing[id]; removing {
+		return fmt.Errorf("%w: %d is being removed", ErrEntityRemoved, id)
+	}
 	existing := m.entities.Get(id)
 	if existing != nil {
 		return fmt.Errorf("%w: %d", ErrEntityExists, id)
 	}
 	m.entities.Add(id, e)
+	e.Base().setOwner(m)
 	m.addGroupIndexLockedByManager(e)
 	return nil
 }
-
-var (
-	onEntityRemoveFromDBMu    sync.RWMutex
-	nextRemoveFromDBHookID    atomic.Uint64
-	onEntityRemoveFromDBHooks []entityRemoveFromDBHook
-)
 
 type entityRemoveFromDBHook struct {
 	id uint64
 	fn func(IThreadSafeEntity)
 }
 
-func RegisterOnEntityRemoveFromDB(hook func(IThreadSafeEntity)) func() {
-	if hook == nil {
+func (m *EntityManager) RegisterOnEntityRemoveFromDB(hook func(IThreadSafeEntity)) func() {
+	if m == nil || hook == nil {
 		return func() {}
 	}
-	id := nextRemoveFromDBHookID.Add(1)
-	onEntityRemoveFromDBMu.Lock()
-	onEntityRemoveFromDBHooks = append(onEntityRemoveFromDBHooks, entityRemoveFromDBHook{id: id, fn: hook})
-	onEntityRemoveFromDBMu.Unlock()
+	m.hookMu.Lock()
+	m.nextHookID++
+	id := m.nextHookID
+	m.removeFromDBHooks = append(m.removeFromDBHooks, entityRemoveFromDBHook{id: id, fn: hook})
+	m.hookMu.Unlock()
 	return func() {
-		onEntityRemoveFromDBMu.Lock()
-		defer onEntityRemoveFromDBMu.Unlock()
-		for i, item := range onEntityRemoveFromDBHooks {
+		m.hookMu.Lock()
+		defer m.hookMu.Unlock()
+		for i, item := range m.removeFromDBHooks {
 			if item.id == id {
-				onEntityRemoveFromDBHooks = append(onEntityRemoveFromDBHooks[:i], onEntityRemoveFromDBHooks[i+1:]...)
+				m.removeFromDBHooks = append(m.removeFromDBHooks[:i], m.removeFromDBHooks[i+1:]...)
 				return
 			}
 		}
 	}
 }
 
-func runOnEntityRemoveFromDB(e IThreadSafeEntity) {
-	onEntityRemoveFromDBMu.RLock()
-	hooks := append([]entityRemoveFromDBHook{}, onEntityRemoveFromDBHooks...)
-	onEntityRemoveFromDBMu.RUnlock()
+func (m *EntityManager) runOnEntityRemoveFromDB(e IThreadSafeEntity) {
+	m.hookMu.RLock()
+	hooks := append([]entityRemoveFromDBHook(nil), m.removeFromDBHooks...)
+	m.hookMu.RUnlock()
 	for _, hook := range hooks {
 		hook.fn(e)
 	}
@@ -146,9 +195,26 @@ func (m *EntityManager) RemoveAfter(e IThreadSafeEntity, reason EntityDestroyRea
 	// Prevent new readers and remove the entity from the global index while the
 	// entity mutex is held. Lifecycle callbacks run after unlock so they can
 	// safely coordinate with other entities through EntityGuard lock ordering.
+	m.addMu.Lock()
+	if m.entities.Get(id) != e {
+		m.addMu.Unlock()
+		mu.Unlock()
+		e.UnTouch()
+		return ErrEntityNotManaged
+	}
+	m.removing[id] = struct{}{}
 	e.SetRemoved()
 	m.entities.Del(e.ID())
 	m.removeGroupIndex(e)
+	m.addMu.Unlock()
+	defer func() {
+		if m.locks != nil {
+			m.locks.ReleaseLock(id)
+		}
+		m.addMu.Lock()
+		delete(m.removing, id)
+		m.addMu.Unlock()
+	}()
 	mu.Unlock()
 
 	e.Base().DestroyAll(reason)
@@ -156,7 +222,7 @@ func (m *EntityManager) RemoveAfter(e IThreadSafeEntity, reason EntityDestroyRea
 	e.OnDestroy(reason)
 
 	if deleteFromDB {
-		runOnEntityRemoveFromDB(e)
+		m.runOnEntityRemoveFromDB(e)
 	}
 
 	e.UnTouch()
@@ -174,7 +240,7 @@ func (m *EntityManager) Get(id int64) IThreadSafeEntity {
 // Returns nil if not found or type mismatch.
 func (m *EntityManager) GetWithCategory(id int64, category EntityCategory) IThreadSafeEntity {
 	e := m.entities.Get(id)
-	if e != nil && e.GetEntityCategory() != category {
+	if e != nil && category != EntityCategoryNone && e.GetEntityCategory() != category {
 		return nil
 	}
 	return e

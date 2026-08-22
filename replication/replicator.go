@@ -19,6 +19,7 @@ type ReplicatorConfig struct {
 type Replicator struct {
 	mu          sync.RWMutex
 	lifecycleMu sync.Mutex
+	transportMu sync.RWMutex
 	active      sync.WaitGroup
 	limits      Limits
 	maxDatagram int
@@ -31,19 +32,59 @@ type Replicator struct {
 	stats       replicatorCounters
 }
 
+// PreparedFrame is an encoded frame whose delivery has not been committed to
+// the session history yet. Custom transports must call Commit only after the
+// complete datagram batch has been accepted for delivery. An abandoned or
+// failed send must call Abort (or simply discard the value).
+type PreparedFrame struct {
+	Frame     DeltaFrame
+	Datagrams [][]byte
+
+	state      *SessionState
+	snapshot   Snapshot
+	sequence   uint32
+	generation uint64
+	full       bool
+	once       sync.Once
+	commitErr  error
+	onCommit   func()
+}
+
+func (p *PreparedFrame) Commit() error {
+	if p == nil || p.state == nil {
+		return ErrPreparedFrameStale
+	}
+	p.once.Do(func() {
+		p.commitErr = p.state.commitPrepared(p.snapshot, p.sequence, p.generation, p.full)
+		if p.commitErr == nil && p.onCommit != nil {
+			p.onCommit()
+		}
+	})
+	return p.commitErr
+}
+
+func (p *PreparedFrame) Abort() {
+	if p == nil {
+		return
+	}
+	p.once.Do(func() { p.commitErr = ErrPreparedFrameStale })
+}
+
 type replicatorCounters struct {
-	published    atomic.Uint64
-	fullFrames   atomic.Uint64
-	deltaFrames  atomic.Uint64
-	datagrams    atomic.Uint64
-	encodedBytes atomic.Uint64
-	sentBytes    atomic.Uint64
-	sendErrors   atomic.Uint64
-	invalidAcks  atomic.Uint64
-	forcedFull   atomic.Uint64
-	qualitySet   atomic.Uint64
-	registered   atomic.Uint64
-	unregistered atomic.Uint64
+	published       atomic.Uint64
+	fullFrames      atomic.Uint64
+	deltaFrames     atomic.Uint64
+	datagrams       atomic.Uint64
+	encodedBytes    atomic.Uint64
+	sentBytes       atomic.Uint64
+	sendErrors      atomic.Uint64
+	invalidAcks     atomic.Uint64
+	forcedFull      atomic.Uint64
+	qualitySet      atomic.Uint64
+	invalidControls atomic.Uint64
+	resyncRequests  atomic.Uint64
+	registered      atomic.Uint64
+	unregistered    atomic.Uint64
 }
 
 type ReplicatorStats struct {
@@ -57,6 +98,8 @@ type ReplicatorStats struct {
 	InvalidAcks        uint64
 	ForcedFull         uint64
 	QualityTierChanges uint64
+	InvalidControls    uint64
+	ResyncRequests     uint64
 	RegisteredSessions uint64
 	RemovedSessions    uint64
 	ActiveSessions     int
@@ -138,6 +181,8 @@ func (r *Replicator) RemoveSession(id SessionID) bool {
 	}
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
+	r.transportMu.Lock()
+	defer r.transportMu.Unlock()
 	r.mu.Lock()
 	state, ok := r.sessions[id]
 	delete(r.sessions, id)
@@ -202,50 +247,72 @@ func (r *Replicator) SetQualityTier(id SessionID, tier uint8) error {
 	return nil
 }
 
+// BuildLatest builds a preview without making the frame acknowledgeable. Code
+// that owns a custom transport should use PrepareLatest and Commit after a
+// successful send.
 func (r *Replicator) BuildLatest(id SessionID) (DeltaFrame, [][]byte, error) {
+	prepared, err := r.PrepareLatest(id)
+	if err != nil {
+		return DeltaFrame{}, nil, err
+	}
+	prepared.Abort()
+	return prepared.Frame, prepared.Datagrams, nil
+}
+
+func (r *Replicator) PrepareLatest(id SessionID) (*PreparedFrame, error) {
 	if !r.begin() {
-		return DeltaFrame{}, nil, ErrReplicatorClosed
+		return nil, ErrReplicatorClosed
 	}
 	defer r.active.Done()
 	state, err := r.session(id)
 	if err != nil {
-		return DeltaFrame{}, nil, err
+		return nil, err
 	}
+	state.sendMu.Lock()
+	defer state.sendMu.Unlock()
+	return r.prepareLatest(state)
+}
+
+func (r *Replicator) prepareLatest(state *SessionState) (*PreparedFrame, error) {
 	current, ok := r.ring.Latest()
 	if !ok {
-		return DeltaFrame{}, nil, ErrSnapshotNotFound
+		return nil, ErrSnapshotNotFound
 	}
-	info, qualityTier, base, previous, sequence, fullRefresh, err := state.prepare(current.Tick)
+	info, qualityTier, base, previous, sequence, generation, fullRefresh, err := state.prepare(current.Tick)
 	if err != nil {
-		return DeltaFrame{}, nil, err
+		return nil, err
 	}
 	current, err = r.projectAndNormalize(ProjectionContext{
 		Session: info, QualityTier: qualityTier, Previous: previous, FullRefresh: fullRefresh,
 	}, current)
 	if err != nil {
-		return DeltaFrame{}, nil, err
+		return nil, err
 	}
 	frame, err := BuildDelta(base, current)
 	if err != nil {
-		return DeltaFrame{}, nil, err
+		return nil, err
 	}
 	encoded, err := EncodeFrame(frame, r.limits)
 	if err != nil {
-		return DeltaFrame{}, nil, err
+		return nil, err
 	}
 	packets, err := FragmentFrame(frame, sequence, encoded, r.maxDatagram, r.limits)
 	if err != nil {
-		return DeltaFrame{}, nil, err
-	}
-	state.markSent(current, frame.Kind == FrameFull)
-	if frame.Kind == FrameFull {
-		r.stats.fullFrames.Add(1)
-	} else {
-		r.stats.deltaFrames.Add(1)
+		return nil, err
 	}
 	r.stats.encodedBytes.Add(uint64(len(encoded)))
 	r.stats.datagrams.Add(uint64(len(packets)))
-	return frame, packets, nil
+	return &PreparedFrame{
+		Frame: frame, Datagrams: packets, state: state, snapshot: current,
+		sequence: sequence, generation: generation, full: frame.Kind == FrameFull,
+		onCommit: func() {
+			if frame.Kind == FrameFull {
+				r.stats.fullFrames.Add(1)
+			} else {
+				r.stats.deltaFrames.Add(1)
+			}
+		},
+	}, nil
 }
 
 func (r *Replicator) SendLatest(ctx context.Context, id SessionID) (DeltaFrame, error) {
@@ -256,34 +323,52 @@ func (r *Replicator) SendLatest(ctx context.Context, id SessionID) (DeltaFrame, 
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	state, err := r.session(id)
+	if err != nil {
+		return DeltaFrame{}, err
+	}
+	state.sendMu.Lock()
+	defer state.sendMu.Unlock()
+	r.transportMu.RLock()
+	defer r.transportMu.RUnlock()
 	r.mu.RLock()
 	transport := r.transport
 	r.mu.RUnlock()
 	if transport == nil {
 		return DeltaFrame{}, ErrTransportMissing
 	}
-	frame, packets, err := r.BuildLatest(id)
+	prepared, err := r.prepareLatest(state)
 	if err != nil {
 		return DeltaFrame{}, err
 	}
+	frame, packets := prepared.Frame, prepared.Datagrams
+	commit := func() error {
+		if err := prepared.Commit(); err != nil {
+			r.stats.sendErrors.Add(1)
+			return err
+		}
+		return nil
+	}
 	if batchTransport, ok := transport.(DatagramBatchTransport); ok {
 		if err := batchTransport.SendDatagramBatch(ctx, id, packets); err != nil {
+			prepared.Abort()
 			r.stats.sendErrors.Add(1)
 			return frame, err
 		}
 		for _, packet := range packets {
 			r.stats.sentBytes.Add(uint64(len(packet)))
 		}
-		return frame, nil
+		return frame, commit()
 	}
 	for _, packet := range packets {
 		if err := transport.SendDatagram(ctx, id, packet); err != nil {
+			prepared.Abort()
 			r.stats.sendErrors.Add(1)
 			return frame, err
 		}
 		r.stats.sentBytes.Add(uint64(len(packet)))
 	}
-	return frame, nil
+	return frame, commit()
 }
 
 func (r *Replicator) SendReliable(ctx context.Context, id SessionID, payload []byte) error {
@@ -297,6 +382,8 @@ func (r *Replicator) SendReliable(ctx context.Context, id SessionID, payload []b
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	r.transportMu.RLock()
+	defer r.transportMu.RUnlock()
 	r.mu.RLock()
 	transport := r.transport
 	r.mu.RUnlock()
@@ -317,6 +404,8 @@ func (r *Replicator) SetTransport(transport Transport) error {
 	}
 	r.lifecycleMu.Lock()
 	defer r.lifecycleMu.Unlock()
+	r.transportMu.Lock()
+	defer r.transportMu.Unlock()
 	r.mu.RLock()
 	if r.closed {
 		r.mu.RUnlock()
@@ -428,6 +517,7 @@ func (r *Replicator) Stats() ReplicatorStats {
 		EncodedBytes: r.stats.encodedBytes.Load(), SentBytes: r.stats.sentBytes.Load(),
 		SendErrors: r.stats.sendErrors.Load(), InvalidAcks: r.stats.invalidAcks.Load(),
 		ForcedFull: r.stats.forcedFull.Load(), QualityTierChanges: r.stats.qualitySet.Load(), RegisteredSessions: r.stats.registered.Load(),
+		InvalidControls: r.stats.invalidControls.Load(), ResyncRequests: r.stats.resyncRequests.Load(),
 		RemovedSessions: r.stats.unregistered.Load(), ActiveSessions: active, SnapshotsRetained: r.ring.Len(),
 	}
 }

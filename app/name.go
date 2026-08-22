@@ -7,9 +7,10 @@ type ModName string
 type ServiceName string
 
 const (
-	ModHealth        ModName = "health"
-	ModObs           ModName = "obs"
-	ModAdmin         ModName = "admin"
-	ModAdminMetadata ModName = "admin.metadata"
-	ModLifecycle     ModName = "lifecycle"
+	ModHealth         ModName = "health"
+	ModObs            ModName = "obs"
+	ModAdmin          ModName = "admin"
+	ModAdminMetadata  ModName = "admin.metadata"
+	ModLifecycle      ModName = "lifecycle"
+	ModRuntimeFailure ModName = "runtime.failure"
 )

@@ -8,14 +8,12 @@ import (
 
 var ErrRemoteSnapshotStale = errors.New("remote snapshot stale")
 
-// RemoteAcquireMode describes how callers intend to access a remote entity.
-// Write is the existing locked mutation path. ReadOnly is a one-shot safe read
-// from the authoritative entity. Cache is a local read-only materialization.
+// RemoteAcquireMode describes immutable snapshot reads. Remote writes are Nest
+// targets and always use the guarded RemoteWriteBatch path.
 type RemoteAcquireMode uint8
 
 const (
-	RemoteAcquireWrite RemoteAcquireMode = iota + 1
-	RemoteAcquireReadOnly
+	RemoteAcquireReadOnly RemoteAcquireMode = iota + 1
 	RemoteAcquireCache
 )
 
@@ -83,14 +81,14 @@ type RemoteSnapshot struct {
 }
 
 func (s RemoteSnapshot) Accepts(option RemoteReadOption) bool {
-	if option.AllowStale || option.MinVersion == 0 {
-		return option.AllowStale || !s.expiredByOption(option)
+	if s.expiredByOption(option) {
+		return false
 	}
-	return s.Version >= option.MinVersion && !s.expiredByOption(option)
+	return option.AllowStale || option.MinVersion == 0 || s.Version >= option.MinVersion
 }
 
 func (s RemoteSnapshot) Expired(now int64) bool {
-	return s.ExpiresAt > 0 && now > s.ExpiresAt
+	return s.ExpiresAt > 0 && now >= s.ExpiresAt
 }
 
 func (s RemoteSnapshot) expiredByOption(option RemoteReadOption) bool {
@@ -128,9 +126,10 @@ type RemoteSnapshotResolveRequest struct {
 // RemoteViewRef is the generic persisted reference to a server-side read model.
 // It says which remote entity is being consumed and which version was observed.
 type RemoteViewRef struct {
-	EntityID int64
-	Kind     EntityKind
-	Version  uint64
+	EntityID   int64
+	Kind       EntityKind
+	Version    uint64
+	RouteEpoch uint64
 }
 
 func (r RemoteViewRef) Valid() bool {
@@ -148,8 +147,8 @@ func (r RemoteViewRef) UniqueID() int64 {
 	return ResolveEntityID(r.EntityID).UniqueID
 }
 
-func NewRemoteViewRef(entityID int64, kind EntityKind, version uint64) (RemoteViewRef, error) {
-	ref := RemoteViewRef{EntityID: entityID, Kind: kind, Version: version}
+func NewRemoteViewRef(entityID int64, kind EntityKind, version uint64, routeEpoch uint64) (RemoteViewRef, error) {
+	ref := RemoteViewRef{EntityID: entityID, Kind: kind, Version: version, RouteEpoch: routeEpoch}
 	if !ref.Valid() {
 		return RemoteViewRef{}, fmt.Errorf("remote view ref: invalid entity=%d kind=%d", entityID, kind)
 	}

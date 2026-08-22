@@ -1,8 +1,10 @@
 package entity
 
 import (
+	"errors"
 	"sync"
 	"testing"
+	"time"
 )
 
 // mgrTestEntity implements IThreadSafeEntity for testing.
@@ -10,6 +12,17 @@ type mgrTestEntity struct {
 	*EntityBase
 	ComponentManager
 	DaoManager
+}
+
+type blockingDestroyEntity struct {
+	*mgrTestEntity
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (e *blockingDestroyEntity) OnDestroy(EntityDestroyReason) {
+	close(e.entered)
+	<-e.release
 }
 
 func (e *mgrTestEntity) Base() *EntityBase { return e.EntityBase }
@@ -92,6 +105,41 @@ func TestEntityManager_Remove(t *testing.T) {
 	}
 	if mgr.Len() != 0 {
 		t.Fatalf("expected 0, got %d", mgr.Len())
+	}
+}
+
+func TestEntityManager_RemoveFencesSameIDUntilLifecycleCompletes(t *testing.T) {
+	mgr := NewEntityManager()
+	value := &blockingDestroyEntity{
+		mgrTestEntity: newMgrTestEntity(1002, testEntityCategoryPlayer),
+		entered:       make(chan struct{}),
+		release:       make(chan struct{}),
+	}
+	mgr.Add(value)
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.RemoveAfter(value, testDestroyCommon, false, nil)
+	}()
+
+	select {
+	case <-value.entered:
+	case <-time.After(time.Second):
+		t.Fatal("remove did not enter lifecycle callback")
+	}
+	if mgr.Get(value.ID()) != nil {
+		t.Fatal("removing entity must no longer be discoverable")
+	}
+	replacement := newMgrTestEntity(value.ID(), testEntityCategoryPlayer)
+	if err := mgr.TryAdd(replacement); !errors.Is(err, ErrEntityRemoved) {
+		t.Fatalf("TryAdd during removal err=%v, want ErrEntityRemoved", err)
+	}
+
+	close(value.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if err := mgr.TryAdd(replacement); err != nil {
+		t.Fatalf("TryAdd after lifecycle completion: %v", err)
 	}
 }
 

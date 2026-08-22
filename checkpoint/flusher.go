@@ -2,6 +2,7 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -20,19 +21,27 @@ type Flusher struct {
 	stopMu sync.Mutex
 	stopCh chan struct{}
 	cancel context.CancelFunc
+
+	workMu   sync.Mutex
+	inFlight int
+	progress chan struct{}
 }
 
 func newFlusher(journal *Journal, backend StorageBackend, cfg Config, wal SnapshotWAL) *Flusher {
 	return &Flusher{
-		journal: journal,
-		backend: backend,
-		cfg:     cfg,
-		wal:     wal,
+		journal:  journal,
+		backend:  backend,
+		cfg:      cfg,
+		wal:      wal,
+		progress: make(chan struct{}, 1),
 	}
 }
 
 // Start launches flush workers.
 func (f *Flusher) Start(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	runCtx, cancel := context.WithCancel(ctx)
 	f.stopMu.Lock()
 	stopCh := make(chan struct{})
@@ -47,6 +56,9 @@ func (f *Flusher) Start(ctx context.Context) {
 
 // Stop signals workers to finish and waits.
 func (f *Flusher) Stop(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	f.stopMu.Lock()
 	if f.stopCh != nil {
 		close(f.stopCh)
@@ -74,15 +86,31 @@ func (f *Flusher) Stop(ctx context.Context) error {
 
 // FlushAll drains the journal completely. Called during graceful shutdown.
 func (f *Flusher) FlushAll(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		batch := f.journal.PopBatch(f.cfg.BatchSize)
+		batch := f.takeBatch()
 		if len(batch) == 0 {
-			return nil
+			f.workMu.Lock()
+			idle := f.inFlight == 0 && f.journal.Len() == 0
+			f.workMu.Unlock()
+			if idle {
+				return nil
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-f.progress:
+			}
+			continue
 		}
-		if err := f.processBatch(ctx, batch); err != nil {
+		err := f.processBatch(ctx, batch)
+		f.finishBatch()
+		if err != nil {
 			return err
 		}
 	}
@@ -105,7 +133,7 @@ func (f *Flusher) worker(ctx context.Context, stopCh <-chan struct{}, id int) {
 		case <-stopCh:
 			return
 		case <-ticker.C:
-			batch := f.journal.PopBatch(f.cfg.BatchSize)
+			batch := f.takeBatch()
 			if len(batch) == 0 {
 				if f.journal.IsClosed() {
 					return
@@ -113,12 +141,37 @@ func (f *Flusher) worker(ctx context.Context, stopCh <-chan struct{}, id int) {
 				continue
 			}
 			if err := f.processBatch(ctx, batch); err != nil {
+				f.finishBatch()
 				if ctx.Err() != nil {
 					return
 				}
 				slog.Error("checkpoint process batch failed", "worker", id, "err", err)
+				continue
 			}
+			f.finishBatch()
 		}
+	}
+}
+
+func (f *Flusher) takeBatch() []JournalEntry {
+	f.workMu.Lock()
+	defer f.workMu.Unlock()
+	batch := f.journal.TryPopBatch(f.cfg.BatchSize)
+	if len(batch) > 0 {
+		f.inFlight++
+	}
+	return batch
+}
+
+func (f *Flusher) finishBatch() {
+	f.workMu.Lock()
+	if f.inFlight > 0 {
+		f.inFlight--
+	}
+	f.workMu.Unlock()
+	select {
+	case f.progress <- struct{}{}:
+	default:
 	}
 }
 
@@ -162,6 +215,7 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 	}
 	saveMap := make(map[key]SaveItem)
 	removes = make(map[removeKey][]int64)
+	removeIndex := make(map[key]removeKey)
 
 	for _, entry := range entries {
 		for _, item := range entry.Items {
@@ -171,9 +225,19 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 				removes[rk] = append(removes[rk], item.ID)
 				// Also remove from saveMap if present
 				delete(saveMap, key{item.Db, item.DbScope, item.Collection, item.ID})
+				removeIndex[key{item.Db, item.DbScope, item.Collection, item.ID}] = rk
 				continue
 			}
 			k := key{item.Db, item.DbScope, item.Collection, item.ID}
+			// Last operation wins. A save after a tombstone recreates the
+			// document and must cancel the earlier remove from this batch.
+			if rk, ok := removeIndex[k]; ok {
+				removes[rk] = removeID(removes[rk], item.ID)
+				if len(removes[rk]) == 0 {
+					delete(removes, rk)
+				}
+				delete(removeIndex, k)
+			}
 			if existing, ok := saveMap[k]; ok {
 				saveMap[k] = mergeSaveItem(existing, item)
 			} else {
@@ -199,6 +263,15 @@ func (f *Flusher) dedup(entries []JournalEntry) (saves []SaveItem, removes map[r
 		return saves[i].ID < saves[j].ID
 	})
 	return saves, removes
+}
+
+func removeID(ids []int64, target int64) []int64 {
+	for i := range ids {
+		if ids[i] == target {
+			return append(ids[:i], ids[i+1:]...)
+		}
+	}
+	return ids
 }
 
 type removeKey struct {
@@ -324,14 +397,8 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 
 		// Process results
 		ackItems := make([]SaveItem, 0, len(results))
+		var itemFailure error
 		for i, r := range results {
-			tracker := items[i].Tracker
-			if tracker == nil && len(items[i].targets) == 0 {
-				if r.OK || r.VersionConflict {
-					ackItems = append(ackItems, items[i])
-				}
-				continue
-			}
 			if r.OK {
 				commitPersistItem(items[i])
 				ackItems = append(ackItems, items[i])
@@ -344,6 +411,11 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 					"ver", items[i].Version)
 			} else {
 				rollbackPersistItem(items[i])
+				failure := r.Err
+				if failure == nil {
+					failure = fmt.Errorf("backend rejected save")
+				}
+				itemFailure = errors.Join(itemFailure, fmt.Errorf("%s/%d: %w", items[i].Collection, items[i].ID, failure))
 				slog.Warn("checkpoint save item failed",
 					"coll", items[i].Collection, "id", items[i].ID,
 					"err", r.Err)
@@ -354,7 +426,7 @@ func (f *Flusher) flushSaveBatch(ctx context.Context, items []SaveItem) error {
 				slog.Warn("checkpoint redis wal ack failed", "err", err, "items", len(ackItems))
 			}
 		}
-		return nil
+		return itemFailure
 	}
 }
 
@@ -404,7 +476,19 @@ func (f *Flusher) flushRemoves(ctx context.Context, removes map[removeKey][]int6
 		for {
 			err := f.backend.BulkRemove(ctx, RemoveOp{Db: key.db, DbScope: key.dbScope, Collection: key.coll, IDs: ids, Fence: key.fence, OwnerSid: key.ownerSid, Shared: key.shared})
 			if err == nil {
-				break
+				if f.wal != nil {
+					ackItems := make([]SaveItem, 0, len(ids))
+					for _, id := range ids {
+						ackItems = append(ackItems, SaveItem{Db: key.db, DbScope: key.dbScope, Collection: key.coll, ID: id, Fence: key.fence, OwnerSid: key.ownerSid, Shared: key.shared})
+					}
+					if ackErr := f.wal.Ack(ctx, ackItems); ackErr != nil {
+						err = fmt.Errorf("checkpoint delete WAL ack: %w", ackErr)
+					} else {
+						break
+					}
+				} else {
+					break
+				}
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()

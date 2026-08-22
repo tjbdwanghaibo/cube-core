@@ -33,11 +33,19 @@ type ICollection interface {
 	EnsureIndexes(ctx context.Context, indexes []IndexModel) error
 }
 
+// IStreamingCollection is the production cursor capability used by loaders
+// that must keep memory bounded. Raw BSON is copied before consume returns so
+// callers never retain aliases to the driver's cursor buffer.
+type IStreamingCollection interface {
+	StreamFind(ctx context.Context, filter any, consume func([]byte) error, opts ...FindOption) error
+}
+
 // FindOption configures Find operations.
 type FindOption struct {
-	Sort  any // sort document (e.g. bson.D{{"created_at", -1}})
-	Limit int64
-	Skip  int64
+	Sort      any // sort document (e.g. bson.D{{"created_at", -1}})
+	Limit     int64
+	Skip      int64
+	BatchSize int32
 }
 
 // FindOneAndUpdateOption configures FindOneAndUpdate operations.

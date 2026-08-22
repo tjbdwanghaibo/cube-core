@@ -210,6 +210,24 @@ func (j *Journal) PopBatch(max int) []JournalEntry {
 	return batch
 }
 
+// TryPopBatch is the non-blocking counterpart used by active flush barriers.
+// It preserves the same FIFO and producer wake-up semantics as PopBatch.
+func (j *Journal) TryPopBatch(max int) []JournalEntry {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.entries) == 0 {
+		return nil
+	}
+	if max <= 0 || max > len(j.entries) {
+		max = len(j.entries)
+	}
+	batch := make([]JournalEntry, max)
+	copy(batch, j.entries[:max])
+	j.entries = j.entries[max:]
+	j.cond.Broadcast()
+	return batch
+}
+
 func (j *Journal) DrainAll() []JournalEntry {
 	j.mu.Lock()
 	defer j.mu.Unlock()

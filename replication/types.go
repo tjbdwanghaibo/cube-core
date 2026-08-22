@@ -23,6 +23,8 @@ var (
 	ErrSnapshotNotFound   = errors.New("replication: snapshot not found")
 	ErrSessionNotFound    = errors.New("replication: session not found")
 	ErrInvalidAck         = errors.New("replication: invalid acknowledgement")
+	ErrInvalidControl     = errors.New("replication: invalid control message")
+	ErrPreparedFrameStale = errors.New("replication: prepared frame is stale")
 	ErrInvalidDatagram    = errors.New("replication: invalid datagram")
 	ErrChecksumMismatch   = errors.New("replication: checksum mismatch")
 	ErrFragmentLimit      = errors.New("replication: fragment limit exceeded")

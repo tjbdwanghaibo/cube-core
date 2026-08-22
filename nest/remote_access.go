@@ -1,16 +1,18 @@
 package nest
 
 import (
-	"github.com/tjbdwanghaibo/cube-core/ctx"
-	"github.com/tjbdwanghaibo/cube-core/entity"
+	"context"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/tjbdwanghaibo/cube-core/ctx"
+	"github.com/tjbdwanghaibo/cube-core/entity"
 )
 
 type RemoteAcquireMode = entity.RemoteAcquireMode
 
 const (
-	RemoteAcquireWrite    = entity.RemoteAcquireWrite
 	RemoteAcquireReadOnly = entity.RemoteAcquireReadOnly
 	RemoteAcquireCache    = entity.RemoteAcquireCache
 )
@@ -19,6 +21,7 @@ var (
 	ErrRemoteAccessAliasDuplicate = errors.New("nest: duplicate remote access alias")
 	ErrRemoteAccessMissing        = errors.New("nest: remote snapshot missing")
 	ErrRemoteSnapshotTypeMismatch = errors.New("nest: remote snapshot type mismatch")
+	ErrRemoteSnapshotIdentity     = errors.New("nest: remote snapshot identity mismatch")
 )
 
 type RemoteAccess struct {
@@ -30,6 +33,9 @@ type RemoteAccess struct {
 	AllowStale     bool
 	CacheTTLMillis int64
 	Required       bool
+	Tenant         uint32
+	Policy         uint32
+	Consistency    entity.RemoteReadConsistency
 }
 
 type RemoteAccessProvider interface {
@@ -42,7 +48,7 @@ type RemoteSnapshotResolver interface {
 
 type remoteSnapshotCtxKey struct{}
 
-func prepareRemoteSnapshots(msg *Msg, resolver RemoteSnapshotResolver) error {
+func prepareRemoteSnapshots(msg *Msg, resolver RemoteSnapshotResolver, manager entity.IRemoteEntityManager) error {
 	if msg == nil {
 		return nil
 	}
@@ -58,10 +64,25 @@ func prepareRemoteSnapshots(msg *Msg, resolver RemoteSnapshotResolver) error {
 		if _, exists := snapshots[access.Alias]; exists {
 			return fmt.Errorf("%w: alias=%s", ErrRemoteAccessAliasDuplicate, access.Alias)
 		}
-		snapshot, err := resolveRemoteSnapshot(access, resolver)
+		if !access.Ref.Valid() {
+			return fmt.Errorf("nest: remote access %s has invalid ref", access.Alias)
+		}
+		if access.Consistency == 0 && access.Mode != RemoteAcquireReadOnly && access.Mode != RemoteAcquireCache {
+			return fmt.Errorf("nest: remote access %s has invalid read mode %d", access.Alias, access.Mode)
+		}
+		if access.Consistency > entity.RemoteReadLinearizable {
+			return fmt.Errorf("nest: remote access %s has invalid consistency %d", access.Alias, access.Consistency)
+		}
+		snapshot, err := resolveRemoteSnapshot(access, resolver, manager)
 		if err != nil {
 			if access.Required {
 				return fmt.Errorf("nest: remote access %s: %w", access.Alias, err)
+			}
+			continue
+		}
+		if snapshot.EntityID != access.Ref.EntityID || snapshot.Kind != access.Ref.Kind || snapshot.Scope != access.Scope || snapshot.RouteEpoch != access.Ref.RouteEpoch {
+			if access.Required {
+				return fmt.Errorf("%w: alias=%s", ErrRemoteSnapshotIdentity, access.Alias)
 			}
 			continue
 		}
@@ -84,20 +105,45 @@ func prepareRemoteSnapshots(msg *Msg, resolver RemoteSnapshotResolver) error {
 	return nil
 }
 
-func resolveRemoteSnapshot(access RemoteAccess, resolver RemoteSnapshotResolver) (entity.RemoteSnapshot, error) {
+func resolveRemoteSnapshot(access RemoteAccess, resolver RemoteSnapshotResolver, manager entity.IRemoteEntityManager) (entity.RemoteSnapshot, error) {
 	if resolver != nil {
 		return resolver.ResolveRemoteSnapshot(access)
 	}
-	snapshot, ok, err := entity.ResolveRemoteSnapshot(entity.RemoteSnapshotResolveRequest{
-		Ref:    access.Ref,
-		Mode:   access.Mode,
-		Scope:  access.Scope,
-		Option: remoteReadOption(access),
-	})
-	if !ok {
-		return entity.RemoteSnapshot{}, fmt.Errorf("nest: remote snapshot resolver is not configured")
+	consistency := access.Consistency
+	if consistency == 0 {
+		if access.Mode == RemoteAcquireCache {
+			consistency = entity.RemoteReadCached
+		} else {
+			consistency = entity.RemoteReadMonotonic
+		}
 	}
-	return snapshot, err
+	baseCtx := context.Background()
+	if current := ctx.CurrentContext(); current != nil && current.Base != nil {
+		baseCtx = current.Base
+	}
+	if manager == nil {
+		return entity.RemoteSnapshot{}, fmt.Errorf("nest: Remote Entity snapshot reader is not configured")
+	}
+	envelope, found, err := manager.ReadRemoteSnapshot(baseCtx, entity.RemoteSnapshotKey{
+		Tenant: access.Tenant, EntityID: access.Ref.EntityID, Kind: access.Ref.Kind,
+		Scope: uint32(access.Scope), Policy: access.Policy,
+	}, consistency, access.MinVersion)
+	if err != nil {
+		return entity.RemoteSnapshot{}, err
+	}
+	if !found {
+		return entity.RemoteSnapshot{}, ErrRemoteAccessMissing
+	}
+	data, err := entity.DecodeRemoteSnapshot(envelope)
+	if err != nil {
+		return entity.RemoteSnapshot{}, err
+	}
+	return entity.RemoteSnapshot{
+		EntityID: envelope.Key.EntityID, Kind: envelope.Key.Kind, Scope: uint64(envelope.Key.Scope),
+		Version: envelope.StateVersion, RouteEpoch: envelope.RouteEpoch,
+		Source: entity.RemoteSnapshotSourceCache, ReadAt: time.Now().UnixMilli(),
+		ExpiresAt: envelope.ExpiresAt / int64(time.Millisecond), Data: data,
+	}, nil
 }
 
 func collectRemoteAccess(params []any) []RemoteAccess {
@@ -118,6 +164,7 @@ func remoteReadOption(access RemoteAccess) entity.RemoteReadOption {
 		MinVersion:     access.MinVersion,
 		AllowStale:     access.AllowStale,
 		CacheTTLMillis: access.CacheTTLMillis,
+		NowMillis:      time.Now().UnixMilli(),
 	}
 }
 

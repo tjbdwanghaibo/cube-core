@@ -122,9 +122,16 @@ func TestReplicatorQualityTierProducesRemoveAndCreate(t *testing.T) {
 	if err := replicator.Publish(mustSnapshot(t, 1, []ObjectState{lodObject(1, 2, 3)})); err != nil {
 		t.Fatal(err)
 	}
-	first, _, err := replicator.BuildLatest(88)
+	prepared, err := replicator.PrepareLatest(88)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := prepared.Frame
 	if err != nil || first.Kind != FrameFull || len(first.Objects) != 1 || first.Objects[0].Operation != ObjectCreate {
 		t.Fatalf("initial projection frame=%+v err=%v", first, err)
+	}
+	if err := prepared.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	if err := replicator.Acknowledge(88, 1); err != nil {
 		t.Fatal(err)
@@ -135,9 +142,16 @@ func TestReplicatorQualityTierProducesRemoveAndCreate(t *testing.T) {
 	if err := replicator.Publish(mustSnapshot(t, 2, []ObjectState{lodObject(4, 5, 6)})); err != nil {
 		t.Fatal(err)
 	}
-	removed, _, err := replicator.BuildLatest(88)
+	prepared, err = replicator.PrepareLatest(88)
+	if err != nil {
+		t.Fatal(err)
+	}
+	removed := prepared.Frame
 	if err != nil || len(removed.Objects) != 1 || removed.Objects[0].Operation != ObjectRemove {
 		t.Fatalf("culled projection frame=%+v err=%v", removed, err)
+	}
+	if err := prepared.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	if err := replicator.Acknowledge(88, 2); err != nil {
 		t.Fatal(err)

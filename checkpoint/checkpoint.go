@@ -2,9 +2,17 @@ package checkpoint
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"github.com/tjbdwanghaibo/cube-core/obs"
 	"log/slog"
 	"sync"
+)
+
+var (
+	ErrCheckpointBackendRequired = errors.New("checkpoint: storage backend is required")
+	ErrCheckpointStopped         = errors.New("checkpoint: instance has been stopped and cannot be restarted")
+	ErrCheckpointNotRunning      = errors.New("checkpoint: not running")
 )
 
 // Checkpoint is the main entry point for the save/load subsystem.
@@ -19,6 +27,7 @@ type Checkpoint struct {
 
 	mu      sync.Mutex
 	running bool
+	stopped bool
 }
 
 type SnapshotWAL interface {
@@ -30,8 +39,19 @@ type SnapshotWAL interface {
 	Stats() SnapshotWALStats
 }
 
+// DeleteSnapshotWAL persists delete tombstones. Production WAL
+// implementations must implement this interface; it prevents a crash between
+// journal admission and backend deletion from resurrecting an older snapshot.
+type DeleteSnapshotWAL interface {
+	SubmitDelete(items []SaveItem) bool
+}
+
 type DurableSnapshotWAL interface {
 	SubmitDurable(ctx context.Context, items []SaveItem) bool
+}
+
+type DurableDeleteSnapshotWAL interface {
+	SubmitDeleteDurable(ctx context.Context, items []SaveItem) bool
 }
 
 // New creates a Checkpoint instance.
@@ -53,33 +73,63 @@ func New(backend StorageBackend, opts ...Option) *Checkpoint {
 }
 
 // Start begins the flush workers.
-func (c *Checkpoint) Start(ctx context.Context) {
+func (c *Checkpoint) Start(ctx context.Context) error {
+	if c == nil || c.backend == nil {
+		return ErrCheckpointBackendRequired
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.running {
-		return
+		return nil
 	}
-	c.running = true
+	if c.stopped {
+		return ErrCheckpointStopped
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.wal != nil {
 		c.wal.Start()
+		// Recovery is part of startup, not an optional application step. New
+		// writes are not accepted until every durable record has been applied.
+		if err := c.wal.Replay(ctx, c.backend); err != nil {
+			_ = c.wal.Stop(ctx)
+			return fmt.Errorf("checkpoint: replay WAL: %w", err)
+		}
 	}
 	c.flusher.Start(ctx)
+	c.running = true
 	slog.Info("checkpoint started",
 		"journal_cap", c.cfg.JournalCap,
 		"flush_workers", c.cfg.FlushWorkers,
 		"batch_size", c.cfg.BatchSize,
 		"flush_interval", c.cfg.FlushInterval,
 	)
+	return nil
 }
 
 // Stop gracefully shuts down: closes journal, flushes all pending data, waits for workers.
 func (c *Checkpoint) Stop(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	c.mu.Lock()
 	if !c.running {
+		if !c.stopped {
+			c.stopped = true
+			c.journal.Close()
+		}
 		c.mu.Unlock()
 		return nil
 	}
 	c.running = false
+	c.stopped = true
 	c.mu.Unlock()
 
 	slog.Info("checkpoint stopping, flushing remaining entries", "pending", c.journal.Len())
@@ -114,10 +164,41 @@ func (c *Checkpoint) Stop(ctx context.Context) error {
 	return nil
 }
 
+// Flush waits until every journal entry admitted before the barrier's
+// linearization point, including entries already owned by background workers,
+// has completed persistence. The checkpoint remains running and continues to
+// accept later submissions.
+func (c *Checkpoint) Flush(ctx context.Context) error {
+	if c == nil {
+		return ErrCheckpointNotRunning
+	}
+	c.mu.Lock()
+	running := c.running && !c.stopped
+	c.mu.Unlock()
+	if !running {
+		return ErrCheckpointNotRunning
+	}
+	return c.flusher.FlushAll(ctx)
+}
+
+func (c *Checkpoint) Running() bool {
+	if c == nil {
+		return false
+	}
+	c.mu.Lock()
+	running := c.running && !c.stopped
+	c.mu.Unlock()
+	return running
+}
+
 // Submit pushes save items into the journal.
 // Called from entity guard release (under entity lock).
 // Blocks if journal is at capacity (back-pressure).
 func (c *Checkpoint) Submit(items []SaveItem) bool {
+	items = freezeSaveItems(items)
+	if len(items) == 0 {
+		return true
+	}
 	if c.wal != nil && c.cfg.SnapshotWALMode == SnapshotWALModeDurable {
 		durable, ok := c.wal.(DurableSnapshotWAL)
 		if !ok {
@@ -137,7 +218,11 @@ func (c *Checkpoint) Submit(items []SaveItem) bool {
 		}
 		ok = c.pushJournal(items)
 		if !ok {
-			slog.Warn("checkpoint: journal rejected save batch after durable wal accepted it", "items", len(items))
+			// The operation is accepted because it is durable. Restore the dirty
+			// bits so normal traffic can retry before the next WAL replay.
+			rollbackPersistItems(items)
+			slog.Warn("checkpoint: journal rejected save batch after durable WAL accepted it; retained for replay", "items", len(items))
+			return true
 		}
 		return ok
 	}
@@ -169,11 +254,86 @@ func (c *Checkpoint) SubmitRemove(collection string, ids []int64) bool {
 }
 
 func (c *Checkpoint) SubmitRemoveItems(items []SaveItem) bool {
+	items = normalizeRemoveItems(items)
+	if len(items) == 0 {
+		return true
+	}
+	if c.wal != nil && c.cfg.SnapshotWALMode == SnapshotWALModeDurable {
+		durable, ok := c.wal.(DurableDeleteSnapshotWAL)
+		if !ok {
+			slog.Warn("checkpoint: durable delete WAL is not supported", "items", len(items))
+			return false
+		}
+		ctx := context.Background()
+		cancel := func() {}
+		if c.cfg.SnapshotWALDurableTimeout > 0 {
+			ctx, cancel = context.WithTimeout(ctx, c.cfg.SnapshotWALDurableTimeout)
+		}
+		ok = durable.SubmitDeleteDurable(ctx, items)
+		cancel()
+		if !ok {
+			return false
+		}
+		if c.pushRemoveJournal(items) {
+			return true
+		}
+		slog.Warn("checkpoint: journal rejected delete batch after durable WAL accepted it; retained for replay", "items", len(items))
+		return true
+	}
+	if c.wal != nil && c.cfg.SnapshotWALRequired {
+		deleteWAL, ok := c.wal.(DeleteSnapshotWAL)
+		if !ok || !deleteWAL.SubmitDelete(items) {
+			return false
+		}
+		return c.pushRemoveJournal(items)
+	}
 	ok := c.pushRemoveJournal(items)
-	if ok && c.wal != nil && len(items) > 0 {
-		_ = c.wal.Ack(context.Background(), items)
+	if ok && c.wal != nil {
+		if deleteWAL, supported := c.wal.(DeleteSnapshotWAL); supported {
+			_ = deleteWAL.SubmitDelete(items)
+		} else {
+			slog.Warn("checkpoint: snapshot WAL does not support delete tombstones", "items", len(items))
+		}
 	}
 	return ok
+}
+
+func freezeSaveItems(items []SaveItem) []SaveItem {
+	if len(items) == 0 {
+		return nil
+	}
+	frozen := make([]SaveItem, len(items))
+	for i := range items {
+		frozen[i] = items[i]
+		frozen[i].Data = append([]byte(nil), items[i].Data...)
+		frozen[i].targets = append([]saveTarget(nil), items[i].targets...)
+		if items[i].Mode != SaveModePatch || items[i].Patch.Empty() {
+			frozen[i].Patch = PersistPatch{}
+			continue
+		}
+		patch, err := items[i].Patch.Freeze()
+		if err != nil {
+			// Every generated patch carries a complete BSON fallback. A value
+			// that cannot be safely frozen becomes a full write, never a raced
+			// shallow reference.
+			frozen[i].Mode = SaveModeFull
+			frozen[i].Patch = PersistPatch{}
+			if len(frozen[i].Data) == 0 {
+				frozen[i].Data = append([]byte(nil), items[i].Patch.FullData...)
+			}
+			slog.Warn("checkpoint: unsafe patch converted to full snapshot", "collection", items[i].Collection, "id", items[i].ID, "err", err)
+			continue
+		}
+		frozen[i].Patch = patch
+	}
+	return frozen
+}
+
+// RollbackSaveItems restores dirty masks captured by Snapshot when journal or
+// durable-WAL admission fails. Infrastructure hooks call this before returning
+// control to business code, so no retry bookkeeping leaks into the application.
+func RollbackSaveItems(items []SaveItem) {
+	rollbackPersistItems(items)
 }
 
 func (c *Checkpoint) pushJournal(items []SaveItem) bool {
@@ -225,7 +385,7 @@ func normalizeRemoveItems(items []SaveItem) []SaveItem {
 
 // Load creates a loader and executes templates.
 func (c *Checkpoint) Load(ctx context.Context, templates []LoadTemplate, exister EntityExister) error {
-	loader := NewLoader(c.backend, exister)
+	loader := NewLoader(c.backend, exister, c.cfg.LoadConcurrency)
 	return loader.LoadAll(ctx, templates)
 }
 

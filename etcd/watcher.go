@@ -1,5 +1,7 @@
 package etcd
 
+import "context"
+
 // IWatcher watches key/prefix changes.
 type IWatcher interface {
 	// EventChan returns a channel for receiving watch events.
@@ -23,6 +25,21 @@ type IWatcherReady interface {
 	Ready() <-chan struct{}
 }
 
+// WatchHandler handles events from one watcher in receive order. Handlers are
+// called serially and must honor ctx cancellation. Returning an error stops the
+// subscription and exposes that error through IWatchSubscription.Err.
+type WatchHandler func(ctx context.Context, event *WatchEvent) error
+
+// IWatchSubscription owns a callback consumer and its lifecycle. Err is nil
+// for an explicit Close and otherwise reports context cancellation, watcher
+// termination, callback failure, callback panic, or subscriber backpressure.
+type IWatchSubscription interface {
+	Done() <-chan struct{}
+	Err() error
+	Close() error
+	CloseWithContext(ctx context.Context) error
+}
+
 // WatchEvent represents a key change event.
 type WatchEvent struct {
 	Type   EventType
@@ -40,7 +57,7 @@ const (
 
 // WatchOption configures watch behavior.
 type WatchOption struct {
-	WithPrevKV   bool  // include previous value in events
-	WithRevision int64 // start watching from revision (0 = current)
+	WithPrevKV    bool  // include previous value in events
+	WithRevision  int64 // start watching from revision (0 = current)
 	CreatedNotify bool  // notify when the server has established the watch
 }

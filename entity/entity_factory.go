@@ -1,7 +1,6 @@
 package entity
 
 import (
-	flog "github.com/tjbdwanghaibo/cube-core/log"
 	"fmt"
 	"sync"
 )
@@ -223,18 +222,6 @@ func IsEntityKindRemoteManaged(kind EntityKind) bool {
 	return GetEntityKindRemotePolicy(kind).RemoteManaged()
 }
 
-// --- ID generation hook ---
-
-// GenerateID is the global ID generator function.
-// Must be set by the application layer before creating entities.
-var GenerateID func() (uint64, error)
-
-// --- Global entity manager ---
-
-// Mgr is the global entity manager instance.
-// Must be set by the application layer before creating entities.
-var Mgr *EntityManager
-
 // --- Entity creation ---
 
 func resolveEntityBuilder(param *EntityCreateParam) (*EntityBuilderParam, error) {
@@ -287,6 +274,18 @@ func BuildEntity(param *EntityCreateParam) (IThreadSafeEntity, error) {
 	}
 	if err := validateBuiltEntityPolicy(bp, e); err != nil {
 		return nil, err
+	}
+	if param.RemoteRestore != nil {
+		remote, ok := e.(IThreadSafeRemoteEntity)
+		if !ok {
+			return nil, fmt.Errorf("entity kind %d has remote restore state but is not remote-managed", param.Kind)
+		}
+		if err := remote.SetRemoteVersionVector(*param.RemoteRestore); err != nil {
+			return nil, fmt.Errorf("entity kind %d restore remote version: %w", param.Kind, err)
+		}
+		if err := remote.TransitionRemoteOwnership(RemoteOwnershipRecovering); err != nil {
+			return nil, fmt.Errorf("entity kind %d restore remote ownership: %w", param.Kind, err)
+		}
 	}
 	if e.Base() != nil {
 		e.Base().SetLifetime(resolveEntityLifetime(param, bp))
@@ -344,68 +343,6 @@ func resolveEntityLifetime(param *EntityCreateParam, bp *EntityBuilderParam) Ent
 	return DefaultEntityLifetime(noPersist, remotePolicy)
 }
 
-// CreateEntity creates and publishes an entity in a short-lived guard scope.
-// The entity lock is released before this function returns; subsequent mutation
-// should go through nest/entity handlers.
-func CreateEntity(param *EntityCreateParam) (IThreadSafeEntity, error) {
-	var ret IThreadSafeEntity
-	err := WithGuardScope("entity_create", func(scope *GuardScope) error {
-		e, err := NewEntityInScope(scope, param)
-		if err != nil {
-			return err
-		}
-		ret = e
-		return nil
-	})
-	return ret, err
-}
-
-func NewEntityInScope(scope *GuardScope, param *EntityCreateParam) (IThreadSafeEntity, error) {
-	if scope == nil || scope.guard == nil {
-		return nil, fmt.Errorf("entity guard scope is required")
-	}
-	e, err := NewEntity(param)
-	if err != nil {
-		return nil, err
-	}
-	if !scope.guard.RequireEntity(e) {
-		Mgr.Remove(e, EntityDestroyReason(0), false)
-		return nil, fmt.Errorf("entity guard scope lock failed: %d", e.ID())
-	}
-	return e, nil
-}
-
-// NewEntity creates an entity using the registered builder and publishes it to
-// the global manager. For new entities (IsCreate=true), it generates a new ID
-// and creates DAOs. For loaded entities (IsCreate=false), DAOs should be
-// pre-populated in param.Dao.
-func NewEntity(param *EntityCreateParam) (IThreadSafeEntity, error) {
-	e, err := BuildEntity(param)
-	if err != nil {
-		return nil, err
-	}
-
-	if err := Mgr.TryAdd(e); err != nil {
-		return nil, err
-	}
-	lifetime := EntityLifetimeDefault
-	if base := e.Base(); base != nil {
-		lifetime = base.Lifetime()
-	}
-	flog.Debug("entity: created", "id", e.ID(), "category", e.GetEntityCategory(), "kind", e.GetEntityKind(), "lifetime", lifetime)
-
-	return e, nil
-}
-
-// DestroyEntity removes an entity from the manager and cleans up.
-// If deleteFromDB is true, a delete operation is pushed to the checkpoint journal.
-func DestroyEntity(e IThreadSafeEntity, reason EntityDestroyReason, deleteFromDB bool) {
-	if e != nil {
-		flog.Debug("entity: destroy", "id", e.ID(), "category", e.GetEntityCategory(), "kind", e.GetEntityKind(), "reason", reason, "delete_db", deleteFromDB)
-	}
-	Mgr.Remove(e, reason, deleteFromDB)
-}
-
 func initEntitySync(e IThreadSafeEntity, param *EntityCreateParam, bp *EntityBuilderParam) {
 	if e == nil || e.Base() == nil {
 		return
@@ -421,6 +358,9 @@ func initEntitySync(e IThreadSafeEntity, param *EntityCreateParam, bp *EntityBui
 		}
 		if syncParam.Packer == nil && bp != nil && bp.Sync.PackerFactory != nil {
 			syncParam.Packer = bp.Sync.PackerFactory(e)
+		}
+		if syncParam.EntityKind == 0 {
+			syncParam.EntityKind = uint32(e.GetEntityKind())
 		}
 		e.Base().EnableSync(syncParam)
 		return

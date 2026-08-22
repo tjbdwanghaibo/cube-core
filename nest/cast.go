@@ -3,7 +3,6 @@ package nest
 import (
 	"errors"
 	"fmt"
-	"sync"
 
 	"github.com/tjbdwanghaibo/cube-core/entity"
 )
@@ -103,7 +102,11 @@ func CastMulti(targets ...CastTarget) ([]entity.IThreadSafeEntity, error) {
 	if entity.CurrentGuardScope() == nil {
 		return nil, ErrCastNoContext
 	}
-	getter := globalCastGetter()
+	current := currentNestDispatchMsg()
+	if current == nil {
+		return nil, ErrCastNoContext
+	}
+	getter := current.getter
 	if getter == nil {
 		return nil, ErrCastGetterNotSet
 	}
@@ -125,6 +128,9 @@ func CastMulti(targets ...CastTarget) ([]entity.IThreadSafeEntity, error) {
 		ids[i] = meta.FullID
 		categories[i] = meta.Category
 	}
+	if !guard.CheckContainAllIDs(ids) {
+		return nil, fmt.Errorf("%w: ids=%v", ErrCastDeadlockRisk, ids)
+	}
 
 	remoteRelease, err := prepareCastRemoteEntities(guard, metas)
 	if err != nil {
@@ -139,7 +145,7 @@ func CastMulti(targets ...CastTarget) ([]entity.IThreadSafeEntity, error) {
 		}()
 	}
 
-	es, err := getter.GetMany(ids, categories)
+	es, err := getter.GetMany(nestBaseContext(), ids, categories)
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +185,7 @@ func CastMulti(targets ...CastTarget) ([]entity.IThreadSafeEntity, error) {
 	if prepared {
 		release := remoteRelease
 		remoteRelease = nil
-		guard.AppendPostRelease(release)
+		currentNestDispatchMsg().addRemoteRelease(release)
 	}
 	return es, nil
 }
@@ -198,7 +204,7 @@ func releaseCastEntities(guard *entity.EntityGuard, es []entity.IThreadSafeEntit
 	}
 }
 
-func prepareCastRemoteEntities(guard *entity.EntityGuard, metas []entity.EntityIDMeta) (func(), error) {
+func prepareCastRemoteEntities(guard *entity.EntityGuard, metas []entity.EntityIDMeta) (entity.RemoteEntityRelease, error) {
 	remoteIDs := make([]int64, 0, len(metas))
 	seen := make(map[int64]struct{}, len(metas))
 	for _, meta := range metas {
@@ -217,24 +223,8 @@ func prepareCastRemoteEntities(guard *entity.EntityGuard, metas []entity.EntityI
 	if len(remoteIDs) == 0 {
 		return nil, nil
 	}
-	release, _, err := entity.PrepareRemoteEntities(remoteIDs)
-	return release, err
-}
-
-var globalGetter struct {
-	mu     sync.RWMutex
-	getter entity.Getter
-}
-
-// InitGlobalGetter sets the getter used by Cast* helpers.
-func InitGlobalGetter(getter entity.Getter) {
-	globalGetter.mu.Lock()
-	globalGetter.getter = getter
-	globalGetter.mu.Unlock()
-}
-
-func globalCastGetter() entity.Getter {
-	globalGetter.mu.RLock()
-	defer globalGetter.mu.RUnlock()
-	return globalGetter.getter
+	if currentNestDispatchMsg() == nil {
+		return nil, fmt.Errorf("remote entity cast requires an active Nest dispatch")
+	}
+	return nil, fmt.Errorf("%w: remote targets must be declared before dispatch", entity.ErrRemoteWriteCapabilityDisabled)
 }

@@ -51,37 +51,16 @@ func withCastGroupFunc(t *testing.T) {
 	})
 }
 
-type castRemoteManager struct {
-	prepare func(ids []int64) (func(), error)
-}
-
-func (m *castRemoteManager) PrepareRemoteEntities(ids []int64) (func(), error) {
-	if m.prepare == nil {
-		return nil, nil
-	}
-	return m.prepare(ids)
-}
-
-func (*castRemoteManager) GetOrCreate(int64, entity.EntityCategory, entity.EntityKind) entity.IRemoteEntityWrapper {
-	return nil
-}
-func (*castRemoteManager) Get(int64) (entity.IRemoteEntityWrapper, bool)  { return nil, false }
-func (*castRemoteManager) Remove(int64)                                   {}
-func (*castRemoteManager) SetLoader(entity.IRemoteEntityLoader)           {}
-func (*castRemoteManager) SetMarkerStore(entity.IRemoteEntityMarkerStore) {}
-func (*castRemoteManager) SetSyncer(entity.IRemoteEntitySyncer)           {}
-func (*castRemoteManager) Loader() entity.IRemoteEntityLoader             { return nil }
-func (*castRemoteManager) MarkerStore() entity.IRemoteEntityMarkerStore   { return nil }
-func (*castRemoteManager) Syncer() entity.IRemoteEntitySyncer             { return nil }
-func (*castRemoteManager) ResolveRemoteSnapshot(entity.RemoteSnapshotResolveRequest) (entity.RemoteSnapshot, error) {
-	return entity.RemoteSnapshot{}, nil
+func bindCastGetter(t *testing.T, getter entity.Getter) {
+	t.Helper()
+	release := pushCurrentNestDispatchMsg(&Msg{getter: getter})
+	t.Cleanup(release)
 }
 
 func TestCastPlayerCanCastAllianceAndOtherByCategoryOrder(t *testing.T) {
 	withCastGroupFunc(t)
 	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
+	bindCastGetter(t, getter)
 
 	playerID := mustBuildCastID(t, 100, castPlayerCategory, castPlayerKind)
 	allianceID := mustBuildCastID(t, 200, castAllianceCategory, castAllianceKind)
@@ -118,8 +97,7 @@ func TestCastPlayerCanCastAllianceAndOtherByCategoryOrder(t *testing.T) {
 func TestCastAllianceCanCastOtherByCategoryOrder(t *testing.T) {
 	withCastGroupFunc(t)
 	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
+	bindCastGetter(t, getter)
 
 	allianceID := mustBuildCastID(t, 201, castAllianceCategory, castAllianceKind)
 	otherID := mustBuildCastID(t, 301, castOtherCategory, castOtherKind)
@@ -150,8 +128,6 @@ func TestCastAllianceCanCastOtherByCategoryOrder(t *testing.T) {
 func TestCastRejectsReverseCategoryOrder(t *testing.T) {
 	withCastGroupFunc(t)
 	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
 
 	playerID := mustBuildCastID(t, 101, castPlayerCategory, castPlayerKind)
 	allianceID := mustBuildCastID(t, 202, castAllianceCategory, castAllianceKind)
@@ -175,6 +151,7 @@ func TestCastRejectsReverseCategoryOrder(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			bindCastGetter(t, getter)
 			_, release := entity.NewGuardScope("cast_test")
 			defer release()
 			if !entity.GetEntityGuard().RequireEntity(tc.locked) {
@@ -188,10 +165,30 @@ func TestCastRejectsReverseCategoryOrder(t *testing.T) {
 	}
 }
 
+func TestCastRejectsRemoteAfterLocalBeforePreparingDistributedLock(t *testing.T) {
+	withCastGroupFunc(t)
+	getter := newMockGetter()
+	bindCastGetter(t, getter)
+
+	playerID := mustBuildCastID(t, 401, castPlayerCategory, castPlayerKind)
+	remoteID := mustBuildCastID(t, 402, castOtherCategory, nestRemoteManagedKind)
+	player := newMockEntityWithKind(playerID, castPlayerCategory, castPlayerKind)
+	getter.Add(player)
+
+	_, release := entity.NewGuardScope("cast_remote_order_test")
+	defer release()
+	if !entity.GetEntityGuard().RequireEntity(player) {
+		t.Fatal("lock player")
+	}
+	_, err := CastTargetOne[*mockEntity](NewCastTarget(remoteID))
+	if !errors.Is(err, ErrCastDeadlockRisk) {
+		t.Fatalf("err = %v, want ErrCastDeadlockRisk", err)
+	}
+}
+
 func TestCastRejectsInvalidTargetID(t *testing.T) {
 	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
+	bindCastGetter(t, getter)
 
 	_, release := entity.NewGuardScope("cast_test")
 	defer release()
@@ -202,54 +199,24 @@ func TestCastRejectsInvalidTargetID(t *testing.T) {
 	}
 }
 
-func TestCastPreparesRemoteManagedEntity(t *testing.T) {
+func TestCastRejectsDynamicRemoteManagedEntity(t *testing.T) {
 	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
 
 	category := castOtherCategory
 	remoteID := mustBuildCastID(t, 300, category, nestRemoteManagedKind)
-	remoteEntity := newMockEntityWithKind(remoteID, category, nestRemoteManagedKind)
 
-	var prepared []int64
-	releaseCalled := false
-	remoteMgr := &castRemoteManager{prepare: func(ids []int64) (func(), error) {
-		prepared = append(prepared, ids...)
-		getter.Add(remoteEntity)
-		return func() { releaseCalled = true }, nil
-	}}
-	entity.BindRemoteEntityManager(remoteMgr)
-	t.Cleanup(func() { entity.UnbindRemoteEntityManager(remoteMgr) })
-
+	msg := &Msg{getter: getter}
+	releaseCurrent := pushCurrentNestDispatchMsg(msg)
+	defer releaseCurrent()
 	_, releaseGuard := entity.NewGuardScope("cast_test")
-	got, err := CastTargetOne[*mockEntity](NewCastTarget(remoteID))
-	if err != nil {
-		releaseGuard()
-		t.Fatalf("CastTargetOne remote: %v", err)
-	}
-	if got != remoteEntity {
-		releaseGuard()
-		t.Fatalf("casted remote = %p, want %p", got, remoteEntity)
-	}
-	if len(prepared) != 1 || prepared[0] != remoteID {
-		releaseGuard()
-		t.Fatalf("prepared = %v, want [%d]", prepared, remoteID)
-	}
-	if releaseCalled {
-		releaseGuard()
-		t.Fatal("remote release should wait for guard release")
-	}
-	releaseGuard()
-	if !releaseCalled {
-		t.Fatal("remote release should run when guard scope releases")
+	defer releaseGuard()
+	_, err := CastTargetOne[*mockEntity](NewCastTarget(remoteID))
+	if !errors.Is(err, entity.ErrRemoteWriteCapabilityDisabled) {
+		t.Fatalf("dynamic remote cast error=%v", err)
 	}
 }
 
 func TestCastRequiresContext(t *testing.T) {
-	getter := newMockGetter()
-	InitGlobalGetter(getter)
-	t.Cleanup(func() { InitGlobalGetter(nil) })
-
 	_, err := CastTargetOne[*mockEntity](NewCastTarget(1))
 	if !errors.Is(err, ErrCastNoContext) {
 		t.Fatalf("err = %v, want ErrCastNoContext", err)

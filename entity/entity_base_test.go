@@ -109,8 +109,15 @@ func TestConcurrentTouch(t *testing.T) {
 func TestEntityGuardReleaseContinuesAfterHookPanic(t *testing.T) {
 	e1 := newTestEntity(101, testEntityCategoryPlayer)
 	e2 := newTestEntity(102, testEntityCategoryAlliance)
+	manager := NewEntityManager()
+	if err := manager.TryAdd(e1); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.TryAdd(e2); err != nil {
+		t.Fatal(err)
+	}
 
-	unregister := RegisterOnEntityRelease(func(e IThreadSafeEntity) {
+	unregister := manager.RegisterOnEntityRelease(func(e IThreadSafeEntity) {
 		if e.ID() == e1.ID() {
 			panic("release failed")
 		}
@@ -129,6 +136,27 @@ func TestEntityGuardReleaseContinuesAfterHookPanic(t *testing.T) {
 
 	if len(guard.eMap) != 0 {
 		t.Fatalf("all locks should be released, remaining=%d", len(guard.eMap))
+	}
+}
+
+func TestEntityReleaseHooksAreManagerScoped(t *testing.T) {
+	firstManager := NewEntityManager()
+	secondManager := NewEntityManager()
+	first := newTestEntity(201, testEntityCategoryPlayer)
+	second := newTestEntity(202, testEntityCategoryAlliance)
+	firstManager.Add(first)
+	secondManager.Add(second)
+	var firstCalls, secondCalls int
+	defer firstManager.RegisterOnEntityRelease(func(IThreadSafeEntity) { firstCalls++ })()
+	defer secondManager.RegisterOnEntityRelease(func(IThreadSafeEntity) { secondCalls++ })()
+	guard := GetEntityGuard()
+	if !guard.RequireEntity(first) {
+		t.Fatal("lock first")
+	}
+	guard.ReleaseAll()
+	EntityGuardRelease(guard)
+	if firstCalls != 1 || secondCalls != 0 {
+		t.Fatalf("manager hook isolation failed: first=%d second=%d", firstCalls, secondCalls)
 	}
 }
 

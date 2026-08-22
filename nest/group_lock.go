@@ -13,7 +13,19 @@ const entityLockGroupDispatchRetryMax = 4
 
 type EntityLockGroupScope struct {
 	groupID int64
+	store   entityGroupStore
 	prev    *EntityLockGroupScope
+}
+
+type entityGroupStore interface {
+	GetGroupEntity(groupID, entityID int64) entity.IThreadSafeEntity
+	GetGroupEntities(groupID int64) []entity.IThreadSafeEntity
+	UpdateEntityGroup(entity.IThreadSafeEntity, int64) error
+}
+
+func groupStoreOf(getter entity.Getter) entityGroupStore {
+	store, _ := getter.(entityGroupStore)
+	return store
 }
 
 var entityLockGroupScopes sync.Map // map[int64]*EntityLockGroupScope
@@ -35,10 +47,10 @@ func (s *EntityLockGroupScope) GroupID() int64 {
 }
 
 func (s *EntityLockGroupScope) Get(entityID int64) entity.IThreadSafeEntity {
-	if s == nil || s.groupID == 0 || entityID == 0 || entity.Mgr == nil {
+	if s == nil || s.groupID == 0 || entityID == 0 || s.store == nil {
 		return nil
 	}
-	ent := entity.Mgr.GetGroupEntity(s.groupID, entityID)
+	ent := s.store.GetGroupEntity(s.groupID, entityID)
 	if ent == nil || ent.Base() == nil || ent.Base().GroupLockID() != s.groupID {
 		return nil
 	}
@@ -46,10 +58,10 @@ func (s *EntityLockGroupScope) Get(entityID int64) entity.IThreadSafeEntity {
 }
 
 func (s *EntityLockGroupScope) Range(fn func(entity.IThreadSafeEntity) bool) {
-	if s == nil || s.groupID == 0 || fn == nil || entity.Mgr == nil {
+	if s == nil || s.groupID == 0 || fn == nil || s.store == nil {
 		return
 	}
-	for _, ent := range entity.Mgr.GetGroupEntities(s.groupID) {
+	for _, ent := range s.store.GetGroupEntities(s.groupID) {
 		if ent == nil || ent.Base() == nil || ent.Base().GroupLockID() != s.groupID {
 			continue
 		}
@@ -72,12 +84,12 @@ func GroupEntityAs[T entity.IThreadSafeEntity](scope *EntityLockGroupScope, enti
 	return typed, true
 }
 
-func pushEntityLockGroupScope(groupID int64) func() {
+func pushEntityLockGroupScope(groupID int64, store entityGroupStore) func() {
 	if groupID == 0 {
 		return func() {}
 	}
 	prev := CurrentEntityLockGroup()
-	scope := &EntityLockGroupScope{groupID: groupID, prev: prev}
+	scope := &EntityLockGroupScope{groupID: groupID, store: store, prev: prev}
 	entityLockGroupScopes.Store(misc.GoID(), scope)
 	return func() {
 		cur := CurrentEntityLockGroup()
@@ -95,26 +107,58 @@ func pushEntityLockGroupScope(groupID int64) func() {
 }
 
 type entityLockGroupLockManager struct {
-	locks sync.Map // map[int64]lock.Mutex
+	mu    sync.Mutex
+	locks map[int64]*entityLockGroupLockEntry
 }
 
-var defaultEntityLockGroupLocks entityLockGroupLockManager
+type entityLockGroupLockEntry struct {
+	groupID int64
+	mu      lock.Mutex
+	refs    int
+}
 
-func entityLockGroupMutex(groupID int64) lock.Mutex {
-	if groupID == 0 {
-		return nil
+func newEntityLockGroupLockManager() *entityLockGroupLockManager {
+	return &entityLockGroupLockManager{locks: make(map[int64]*entityLockGroupLockEntry)}
+
+}
+
+func (m *entityLockGroupLockManager) acquire(groupID int64) (*entityLockGroupLockEntry, bool) {
+	if m == nil || groupID == 0 {
+		return nil, false
 	}
-	if value, ok := defaultEntityLockGroupLocks.locks.Load(groupID); ok {
-		if mu, ok := value.(lock.Mutex); ok {
-			return mu
-		}
+	m.mu.Lock()
+	if m.locks == nil {
+		m.locks = make(map[int64]*entityLockGroupLockEntry)
 	}
-	mu := lock.NewReentrantMutex(-groupID)
-	actual, _ := defaultEntityLockGroupLocks.locks.LoadOrStore(groupID, mu)
-	if ret, ok := actual.(lock.Mutex); ok {
-		return ret
+	entry := m.locks[groupID]
+	if entry == nil {
+		entry = &entityLockGroupLockEntry{groupID: groupID, mu: lock.NewReentrantMutex(-groupID)}
+		m.locks[groupID] = entry
 	}
-	return mu
+	entry.refs++
+	m.mu.Unlock()
+	if entry.mu.TryLock() {
+		return entry, true
+	}
+	m.releaseRef(entry)
+	return nil, false
+}
+
+func (m *entityLockGroupLockManager) release(entry *entityLockGroupLockEntry) {
+	if m == nil || entry == nil {
+		return
+	}
+	entry.mu.Unlock()
+	m.releaseRef(entry)
+}
+
+func (m *entityLockGroupLockManager) releaseRef(entry *entityLockGroupLockEntry) {
+	m.mu.Lock()
+	entry.refs--
+	if entry.refs == 0 && m.locks[entry.groupID] == entry {
+		delete(m.locks, entry.groupID)
+	}
+	m.mu.Unlock()
 }
 
 func resolveDispatchGroupID(lockEs []entity.IThreadSafeEntity) (int64, error) {
@@ -184,7 +228,11 @@ func validateDispatchGroupSnapshots(snapshots []dispatchGroupSnapshot) error {
 	return nil
 }
 
-func lockDispatchEntitiesForHandler(guard *entity.EntityGuard, lockEs []entity.IThreadSafeEntity) ([]entity.IThreadSafeEntity, func(), error) {
+func lockDispatchEntitiesForHandler(locks *entityLockGroupLockManager, guard *entity.EntityGuard, lockEs []entity.IThreadSafeEntity) ([]entity.IThreadSafeEntity, func(), error) {
+	return lockDispatchEntitiesForHandlerWithStore(locks, guard, lockEs, nil)
+}
+
+func lockDispatchEntitiesForHandlerWithStore(locks *entityLockGroupLockManager, guard *entity.EntityGuard, lockEs []entity.IThreadSafeEntity, store entityGroupStore) ([]entity.IThreadSafeEntity, func(), error) {
 	var lastErr error
 	for attempt := 0; attempt < entityLockGroupDispatchRetryMax; attempt++ {
 		snapshots := captureDispatchGroupSnapshots(lockEs)
@@ -192,7 +240,7 @@ func lockDispatchEntitiesForHandler(guard *entity.EntityGuard, lockEs []entity.I
 		if err != nil {
 			return nil, nil, err
 		}
-		acquired, releaseLocks, err := lockDispatchEntitiesWithGroup(guard, lockEs, groupID)
+		acquired, releaseLocks, err := lockDispatchEntitiesWithGroup(locks, guard, lockEs, groupID, store)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -212,7 +260,7 @@ func lockDispatchEntitiesForHandler(guard *entity.EntityGuard, lockEs []entity.I
 	return nil, nil, lastErr
 }
 
-func lockDispatchEntitiesWithGroup(guard *entity.EntityGuard, lockEs []entity.IThreadSafeEntity, groupID int64) ([]entity.IThreadSafeEntity, func(), error) {
+func lockDispatchEntitiesWithGroup(locks *entityLockGroupLockManager, guard *entity.EntityGuard, lockEs []entity.IThreadSafeEntity, groupID int64, store entityGroupStore) ([]entity.IThreadSafeEntity, func(), error) {
 	if groupID == 0 {
 		acquired, err := lockDispatchEntities(guard, lockEs)
 		if err != nil {
@@ -222,24 +270,21 @@ func lockDispatchEntitiesWithGroup(guard *entity.EntityGuard, lockEs []entity.IT
 			releaseDispatchLocks(guard, acquired)
 		}, nil
 	}
-	groupMu := entityLockGroupMutex(groupID)
-	if groupMu == nil {
+	groupEntry, ok := locks.acquire(groupID)
+	if !ok {
 		return nil, nil, ErrLockTimeout
 	}
-	if !groupMu.TryLock() {
-		return nil, nil, ErrLockTimeout
-	}
-	releaseScope := pushEntityLockGroupScope(groupID)
+	releaseScope := pushEntityLockGroupScope(groupID, store)
 	acquired, err := tryLockDispatchEntities(guard, lockEs)
 	if err != nil {
 		releaseScope()
-		groupMu.Unlock()
+		locks.release(groupEntry)
 		return nil, nil, err
 	}
 	return acquired, func() {
 		releaseDispatchLocks(guard, acquired)
 		releaseScope()
-		groupMu.Unlock()
+		locks.release(groupEntry)
 	}, nil
 }
 

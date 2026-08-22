@@ -3,13 +3,13 @@ package nest
 import (
 	"container/heap"
 	"context"
+	"errors"
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/entity"
 	flog "github.com/tjbdwanghaibo/cube-core/log"
 	"github.com/tjbdwanghaibo/cube-core/misc"
 	"github.com/tjbdwanghaibo/cube-core/obs"
 	"github.com/tjbdwanghaibo/cube-core/worker"
-	"errors"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,6 +18,8 @@ import (
 type Dispatcher struct {
 	Name          string
 	MsgCap        int
+	DelayedMsgCap int
+	MaxDelay      time.Duration
 	pool          *worker.Pool[*Msg]
 	hbPool        *worker.Pool[*Msg]
 	costPool      *worker.Pool[*Msg]
@@ -33,6 +35,7 @@ type Dispatcher struct {
 	delayDone     chan struct{}
 	delaySeq      uint64
 	stopped       bool
+	fenceErr      error
 	observeSeq    uint64
 	processed     atomic.Uint64
 	slow200ms     atomic.Uint64
@@ -85,8 +88,25 @@ func NewDispatcher(name string, workerNum, hbWorkerNum int, msgCap int, handler 
 	if ret.workerNum <= 0 {
 		ret.workerNum = 1
 	}
+	if ret.MsgCap <= 0 {
+		ret.MsgCap = 10000
+	}
+	ret.DelayedMsgCap = ret.MsgCap
+	ret.MaxDelay = 24 * time.Hour
 	ret.costWorkerNum = ret.workerNum
 	return ret
+}
+
+func (m *Dispatcher) ConfigureDelayedAdmission(capacity int, maxDelay time.Duration) {
+	if m == nil {
+		return
+	}
+	if capacity > 0 {
+		m.DelayedMsgCap = capacity
+	}
+	if maxDelay > 0 {
+		m.MaxDelay = maxDelay
+	}
 }
 
 func (m *Dispatcher) OnInit() {
@@ -97,6 +117,7 @@ func (m *Dispatcher) OnInit() {
 	m.delayStop = make(chan struct{})
 	m.delayDone = make(chan struct{})
 	m.stopped = false
+	m.fenceErr = nil
 	m.mu.Unlock()
 	go m.delayLoop()
 
@@ -118,6 +139,19 @@ func (m *Dispatcher) OnInit() {
 		WorkerNum: m.costWorkerNum,
 		QueueCap:  m.MsgCap,
 	}, m.handler)
+}
+
+// Fence stops admission while leaving worker shutdown to OnDestroy. Messages
+// already queued are rejected by NestDispatch before entity loading/mutation.
+func (m *Dispatcher) Fence(err error) {
+	if m == nil || err == nil {
+		return
+	}
+	m.mu.Lock()
+	if m.fenceErr == nil {
+		m.fenceErr = err
+	}
+	m.mu.Unlock()
 }
 
 func (m *Dispatcher) OnRun() {
@@ -191,66 +225,87 @@ const (
 	spliceDenseGroupLimit = 8
 )
 
-func (m *Dispatcher) SendMsg(msg *Msg) {
+// TrySendMsg transfers ownership of msg to the dispatcher. It returns an
+// admission error when the selected worker cannot accept the message. A failed
+// message is released before the method returns.
+func (m *Dispatcher) TrySendMsg(msg *Msg) error {
 	if msg == nil {
-		return
+		return ErrInvalidMessage
 	}
 	trace := newNestTraceEventInfo(msg)
 	m.mu.Lock()
 	stopped := m.stopped
+	fenced := m.fenceErr
 	m.mu.Unlock()
+	if fenced != nil {
+		emitNestTraceEventInfo(trace, "enqueue", "fenced", 0)
+		if msg.RetChan == nil {
+			logAsyncDispatchFailure(msg, fenced)
+		}
+		recycleMsg(msg)
+		return fenced
+	}
 	if stopped {
 		emitNestTraceEventInfo(trace, "enqueue", "stopped", 0)
-		if msg.RetChan != nil {
-			msg.RetChan <- ErrNestStopped
-		} else {
+		if msg.RetChan == nil {
 			logAsyncDispatchFailure(msg, ErrNestStopped)
 		}
 		recycleMsg(msg)
-		return
+		return ErrNestStopped
 	}
 	msg.OnSend()
-	dispatch := func(pool *worker.Pool[*Msg]) {
+	dispatch := func(pool *worker.Pool[*Msg]) error {
 		if pool == nil {
 			emitNestTraceEventInfo(trace, "enqueue", "stopped", 0)
-			if msg.RetChan != nil {
-				msg.RetChan <- ErrNestStopped
-			} else {
+			if msg.RetChan == nil {
 				logAsyncDispatchFailure(msg, ErrNestStopped)
 			}
 			msg.OnRelease()
-			return
+			return ErrNestStopped
 		}
 		if err := pool.TryDispatch(msg.Key(), msg); err != nil {
 			emitNestTraceEventInfo(trace, "enqueue", "error", 0)
-			if msg.RetChan != nil {
-				msg.RetChan <- err
-			} else {
+			if msg.RetChan == nil {
 				logAsyncDispatchFailure(msg, err)
 			}
 			msg.OnRelease()
-			return
+			return err
 		}
 		emitNestTraceEventInfo(trace, "enqueue", "ok", 0)
+		return nil
 	}
+	var err error
 	if msg.Cost || msg.HasRemote {
 		if m.costPool != nil {
-			dispatch(m.costPool)
+			err = dispatch(m.costPool)
 		} else {
-			dispatch(m.pool)
+			err = dispatch(m.pool)
 		}
 	} else {
 		if msg.Type == MsgTypeBroadcast {
 			if m.hbPool != nil {
-				dispatch(m.hbPool)
+				err = dispatch(m.hbPool)
 			} else {
-				dispatch(m.pool)
+				err = dispatch(m.pool)
 			}
 		} else {
-			dispatch(m.pool)
+			err = dispatch(m.pool)
 		}
 	}
 	m.observeStatsIfDue()
+	return err
+}
+
+func (m *Dispatcher) sendMsg(msg *Msg) {
+	if msg == nil {
+		return
+	}
+	retChan := msg.RetChan
+	if err := m.TrySendMsg(msg); err != nil {
+		if retChan != nil {
+			retChan <- err
+		}
+	}
 }
 
 const dispatcherObserveStatsEvery = 1024
@@ -316,20 +371,60 @@ func logAsyncDispatchFailure(msg *Msg, err error) {
 	)
 }
 
-func (m *Dispatcher) DelaySendMsg(delay time.Duration, msg *Msg) {
-	if delay <= 0 {
-		m.SendMsg(msg)
+func (m *Dispatcher) delaySendMsg(delay time.Duration, msg *Msg) {
+	if msg == nil {
 		return
+	}
+	retChan := msg.RetChan
+	if err := m.TryDelaySendMsg(delay, msg); err != nil && retChan != nil {
+		retChan <- err
+	}
+}
+
+// TryDelaySendMsg transfers ownership of msg to the delay queue. Admission to
+// the worker pool happens when the delay expires; a later overload is observed
+// through Nest metrics/logging because the original caller is no longer
+// waiting at that point.
+func (m *Dispatcher) TryDelaySendMsg(delay time.Duration, msg *Msg) error {
+	if msg == nil {
+		return ErrInvalidMessage
+	}
+	if delay <= 0 {
+		return m.TrySendMsg(msg)
+	}
+	if m.MaxDelay > 0 && delay > m.MaxDelay {
+		recycleMsg(msg)
+		return ErrDelayTooLong
 	}
 	dm := &delayedMsg{
 		due: time.Now().Add(delay),
 		msg: msg,
 	}
 	m.mu.Lock()
+	if m.fenceErr != nil {
+		fenced := m.fenceErr
+		m.mu.Unlock()
+		if msg.RetChan == nil {
+			logAsyncDispatchFailure(msg, fenced)
+		}
+		recycleMsg(msg)
+		return fenced
+	}
 	if m.stopped {
 		m.mu.Unlock()
+		if msg.RetChan == nil {
+			logAsyncDispatchFailure(msg, ErrNestStopped)
+		}
 		recycleMsg(msg)
-		return
+		return ErrNestStopped
+	}
+	if m.DelayedMsgCap > 0 && len(m.delayed) >= m.DelayedMsgCap {
+		m.mu.Unlock()
+		if msg.RetChan == nil {
+			logAsyncDispatchFailure(msg, ErrQueueFull)
+		}
+		recycleMsg(msg)
+		return ErrQueueFull
 	}
 	m.delaySeq++
 	dm.seq = m.delaySeq
@@ -338,6 +433,7 @@ func (m *Dispatcher) DelaySendMsg(delay time.Duration, msg *Msg) {
 	notify := m.delayNotify
 	m.mu.Unlock()
 	notifyDelayLoop(notify)
+	return nil
 }
 
 func notifyDelayLoop(ch chan struct{}) {
@@ -397,7 +493,7 @@ func (m *Dispatcher) delayLoop() {
 		if dm == nil {
 			continue
 		}
-		m.SendMsg(dm.msg)
+		m.sendMsg(dm.msg)
 	}
 }
 

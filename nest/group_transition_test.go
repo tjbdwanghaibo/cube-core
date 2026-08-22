@@ -1,6 +1,7 @@
 package nest
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -12,14 +13,10 @@ func TestEntityLockGroupTransitionJoinMoveLeaveUpdatesState(t *testing.T) {
 	ResetHandlersForTest()
 	defer ResetHandlersForTest()
 
-	prevMgr := entity.Mgr
-	entity.Mgr = entity.NewEntityManager()
-	t.Cleanup(func() { entity.Mgr = prevMgr })
-
 	getter := newMockGetter()
 	id := mustBuildCastID(t, 4301, entity.EntityCategory(1), nestLocalKind)
 	e := newMockEntity(id, entity.EntityCategory(1))
-	entity.Mgr.Add(e)
+	getter.groups.Add(e)
 	getter.Add(e)
 
 	InitNest(
@@ -36,7 +33,7 @@ func TestEntityLockGroupTransitionJoinMoveLeaveUpdatesState(t *testing.T) {
 		return e.Base().GroupLockID() == 8101 &&
 			e.Base().GroupEpoch() == 1 &&
 			!e.Base().GroupTransitionPending() &&
-			entity.Mgr.GetGroupEntity(8101, id) == e
+			getter.groups.GetGroupEntity(8101, id) == e
 	})
 
 	if err := Nest.RequestMoveEntityLockGroup(id, 8102); err != nil {
@@ -46,8 +43,8 @@ func TestEntityLockGroupTransitionJoinMoveLeaveUpdatesState(t *testing.T) {
 		return e.Base().GroupLockID() == 8102 &&
 			e.Base().GroupEpoch() == 2 &&
 			!e.Base().GroupTransitionPending() &&
-			entity.Mgr.GetGroupEntity(8101, id) == nil &&
-			entity.Mgr.GetGroupEntity(8102, id) == e
+			getter.groups.GetGroupEntity(8101, id) == nil &&
+			getter.groups.GetGroupEntity(8102, id) == e
 	})
 
 	if err := Nest.RequestLeaveEntityLockGroup(id); err != nil {
@@ -57,7 +54,7 @@ func TestEntityLockGroupTransitionJoinMoveLeaveUpdatesState(t *testing.T) {
 		return e.Base().GroupLockID() == 0 &&
 			e.Base().GroupEpoch() == 3 &&
 			!e.Base().GroupTransitionPending() &&
-			entity.Mgr.GetGroupEntity(8102, id) == nil
+			getter.groups.GetGroupEntity(8102, id) == nil
 	})
 }
 
@@ -74,7 +71,7 @@ func TestEntityLockGroupTransitionPendingGatesNormalDispatch(t *testing.T) {
 	getter.Add(e)
 
 	name := NewHandlerName("test_group_transition_pending_gate")
-	MustRegisterHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 		return nil, errors.New("handler should not run while transition is pending")
 	})
 
@@ -106,7 +103,7 @@ func TestEntityLockGroupTransitionPendingRequeuesSyncDispatch(t *testing.T) {
 
 	name := NewHandlerName("test_group_transition_pending_requeue_sync")
 	called := make(chan struct{}, 1)
-	MustRegisterHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 		called <- struct{}{}
 		return "ok", nil
 	})
@@ -115,7 +112,7 @@ func TestEntityLockGroupTransitionPendingRequeuesSyncDispatch(t *testing.T) {
 		e.Base().ClearGroupTransition()
 	})
 
-	got, err := Nest.Sync(name, id, nil)
+	got, err := Nest.Request(context.Background(), name, id, nil)
 	if err != nil {
 		t.Fatalf("Nest.Sync err = %v, want nil", err)
 	}
@@ -133,14 +130,10 @@ func TestEntityLockGroupTransitionContinuationReturnsSyncResult(t *testing.T) {
 	ResetHandlersForTest()
 	defer ResetHandlersForTest()
 
-	prevMgr := entity.Mgr
-	entity.Mgr = entity.NewEntityManager()
-	t.Cleanup(func() { entity.Mgr = prevMgr })
-
 	getter := newMockGetter()
 	id := mustBuildCastID(t, 4501, entity.EntityCategory(1), nestLocalKind)
 	e := newMockEntity(id, entity.EntityCategory(1))
-	entity.Mgr.Add(e)
+	getter.groups.Add(e)
 	getter.Add(e)
 
 	InitNest(
@@ -152,7 +145,7 @@ func TestEntityLockGroupTransitionContinuationReturnsSyncResult(t *testing.T) {
 
 	startName := NewHandlerName("test_group_transition_continuation_start")
 	continuationName := NewHandlerName("test_group_transition_continuation_after_join")
-	MustRegisterHandler(startName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(startName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 		if err := Nest.RequestJoinEntityLockGroup(
 			id,
 			8301,
@@ -162,7 +155,7 @@ func TestEntityLockGroupTransitionContinuationReturnsSyncResult(t *testing.T) {
 		}
 		return nil, ErrEntityGroupTransitionScheduled
 	})
-	MustRegisterHandler(continuationName, func(es []entity.IThreadSafeEntity, params []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(continuationName, func(es []entity.IThreadSafeEntity, params []any, _ ...HandlerOption) (any, error) {
 		if len(params) != 1 || params[0] != "ready" {
 			return nil, errors.New("continuation params mismatch")
 		}
@@ -176,7 +169,7 @@ func TestEntityLockGroupTransitionContinuationReturnsSyncResult(t *testing.T) {
 		return "joined", nil
 	})
 
-	got, err := Nest.Sync(startName, id, nil)
+	got, err := Nest.Request(context.Background(), startName, id, nil)
 	if err != nil {
 		t.Fatalf("Nest.Sync: %v", err)
 	}
@@ -192,14 +185,10 @@ func TestEntityLockGroupTransitionRetriesWhenEntityLockBusy(t *testing.T) {
 	ResetHandlersForTest()
 	defer ResetHandlersForTest()
 
-	prevMgr := entity.Mgr
-	entity.Mgr = entity.NewEntityManager()
-	t.Cleanup(func() { entity.Mgr = prevMgr })
-
 	getter := newMockGetter()
 	id := mustBuildCastID(t, 4601, entity.EntityCategory(1), nestLocalKind)
 	e := newMockEntity(id, entity.EntityCategory(1))
-	entity.Mgr.Add(e)
+	getter.groups.Add(e)
 	getter.Add(e)
 
 	InitNest(
@@ -225,19 +214,15 @@ func TestEntityLockGroupTransitionRetriesWhenEntityLockBusy(t *testing.T) {
 	waitForNestCondition(t, func() bool {
 		return e.Base().GroupLockID() == 8401 &&
 			!e.Base().GroupTransitionPending() &&
-			entity.Mgr.GetGroupEntity(8401, id) == e
+			getter.groups.GetGroupEntity(8401, id) == e
 	})
 }
 
 func TestEntityLockGroupTransitionTimeoutClearsPending(t *testing.T) {
-	prevMgr := entity.Mgr
-	entity.Mgr = entity.NewEntityManager()
-	t.Cleanup(func() { entity.Mgr = prevMgr })
-
 	getter := newMockGetter()
 	id := mustBuildCastID(t, 4602, entity.EntityCategory(1), nestLocalKind)
 	e := newMockEntity(id, entity.EntityCategory(1))
-	entity.Mgr.Add(e)
+	getter.groups.Add(e)
 	getter.Add(e)
 
 	if !e.Base().BeginGroupTransition(entity.EntityGroupTransitionJoin, 8402) {

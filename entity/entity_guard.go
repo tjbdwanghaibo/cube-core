@@ -4,14 +4,15 @@ import (
 	"github.com/tjbdwanghaibo/cube-core/misc"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 )
 
 // Entity group constants for lock ordering (deadlock prevention).
 const (
-	EntityGroupPlayer = iota
+	// Remote is first because top-level dispatch acquires remote ownership and
+	// distributed locks before any local entity mutex.
+	EntityGroupRemote = iota
+	EntityGroupPlayer
 	EntityGroupAlliance
-	EntityGroupRemote
 	EntityGroupOther
 	EntityGroupCnt
 )
@@ -32,31 +33,26 @@ func GetEntityGroup(guid int64) int {
 	return EntityGroupOther
 }
 
-var (
-	onEntityReleaseMu    sync.RWMutex
-	nextReleaseHookID    atomic.Uint64
-	onEntityReleaseHooks []entityReleaseHook
-)
-
 type entityReleaseHook struct {
 	id uint64
 	fn func(IThreadSafeEntity)
 }
 
-func RegisterOnEntityRelease(hook func(IThreadSafeEntity)) func() {
-	if hook == nil {
+func (m *EntityManager) RegisterOnEntityRelease(hook func(IThreadSafeEntity)) func() {
+	if m == nil || hook == nil {
 		return func() {}
 	}
-	id := nextReleaseHookID.Add(1)
-	onEntityReleaseMu.Lock()
-	onEntityReleaseHooks = append(onEntityReleaseHooks, entityReleaseHook{id: id, fn: hook})
-	onEntityReleaseMu.Unlock()
+	m.hookMu.Lock()
+	m.nextHookID++
+	id := m.nextHookID
+	m.releaseHooks = append(m.releaseHooks, entityReleaseHook{id: id, fn: hook})
+	m.hookMu.Unlock()
 	return func() {
-		onEntityReleaseMu.Lock()
-		defer onEntityReleaseMu.Unlock()
-		for i, item := range onEntityReleaseHooks {
+		m.hookMu.Lock()
+		defer m.hookMu.Unlock()
+		for i, item := range m.releaseHooks {
 			if item.id == id {
-				onEntityReleaseHooks = append(onEntityReleaseHooks[:i], onEntityReleaseHooks[i+1:]...)
+				m.releaseHooks = append(m.releaseHooks[:i], m.releaseHooks[i+1:]...)
 				return
 			}
 		}
@@ -64,9 +60,13 @@ func RegisterOnEntityRelease(hook func(IThreadSafeEntity)) func() {
 }
 
 func runOnEntityRelease(ent IThreadSafeEntity) {
-	onEntityReleaseMu.RLock()
-	hooks := append([]entityReleaseHook{}, onEntityReleaseHooks...)
-	onEntityReleaseMu.RUnlock()
+	if ent == nil || ent.Base() == nil || ent.Base().owningManager() == nil {
+		return
+	}
+	manager := ent.Base().owningManager()
+	manager.hookMu.RLock()
+	hooks := append([]entityReleaseHook(nil), manager.releaseHooks...)
+	manager.hookMu.RUnlock()
 	for _, hook := range hooks {
 		hook.fn(ent)
 	}
@@ -238,8 +238,8 @@ func (e *EntityGuard) RequireEntity(ent IThreadSafeEntity) bool {
 
 // CheckContainAllLock checks if all entities in es are already locked or safe to lock.
 // Lock order follows the application group order from lower value to higher
-// value. In cube this means Player -> Alliance -> Other. Once a later group is
-// held, callers must not acquire an earlier or same-level group through cast.
+// value: Remote -> Player -> Alliance -> Other. Once a later group is held,
+// callers must not acquire an earlier or same-level group through cast.
 func (e *EntityGuard) CheckContainAllLock(es []IThreadSafeEntity) bool {
 	if len(es) == 0 || len(e.eMap) == 0 {
 		return true
@@ -263,6 +263,30 @@ func (e *EntityGuard) CheckContainAllLock(es []IThreadSafeEntity) bool {
 			continue
 		}
 		return false
+	}
+	return true
+}
+
+// CheckContainAllIDs performs the same lock-order validation before entities
+// are loaded. Remote cast must use this preflight before acquiring a
+// distributed lock.
+func (e *EntityGuard) CheckContainAllIDs(ids []int64) bool {
+	if len(ids) == 0 || len(e.eMap) == 0 {
+		return true
+	}
+	maxLockedGroup := -1
+	for id := range e.eMap {
+		if group := GetEntityGroup(id); group > maxLockedGroup {
+			maxLockedGroup = group
+		}
+	}
+	for _, id := range ids {
+		if _, exists := e.eMap[id]; exists {
+			continue
+		}
+		if GetEntityGroup(id) <= maxLockedGroup {
+			return false
+		}
 	}
 	return true
 }

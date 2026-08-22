@@ -3,8 +3,7 @@ package fmap
 import (
 	"sync"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 // SmallSafeMap is a compact, thread-safe map for small object counts.
@@ -119,11 +118,11 @@ func (m *SmallSafeMap[K, V]) SetRawMap(src map[K]V) {
 	}
 }
 
-func (m *SmallSafeMap[K, V]) MarshalBSONValue() (bsontype.Type, []byte, error) {
+func (m *SmallSafeMap[K, V]) MarshalBSONValue() (bson.Type, []byte, error) {
 	return bson.MarshalValue(m.RawMap())
 }
 
-func (m *SmallSafeMap[K, V]) UnmarshalBSONValue(t bsontype.Type, data []byte) error {
+func (m *SmallSafeMap[K, V]) UnmarshalBSONValue(t bson.Type, data []byte) error {
 	var raw map[K]V
 	if err := bson.UnmarshalValue(t, data, &raw); err != nil {
 		return err

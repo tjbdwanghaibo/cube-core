@@ -1,13 +1,14 @@
 package nest
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/entity"
 	"github.com/tjbdwanghaibo/cube-core/hotcode"
 	flog "github.com/tjbdwanghaibo/cube-core/log"
 	"github.com/tjbdwanghaibo/cube-core/obs"
-	"errors"
-	"fmt"
 	"log/slog"
 	"runtime"
 	"sort"
@@ -31,10 +32,26 @@ func HandlerPatchName(name HandlerName) string {
 }
 
 func RegisterHandler(name HandlerName, handler BaseHandler) error {
+	return RegisterHandlerWithMeta(name, handler, HandlerMeta{Rollback: RollbackState, Durability: DurabilityAsync})
+}
+
+// RegisterMemoryHandler is the explicit opt-out for ephemeral handlers whose
+// state must never be persisted. Production business mutations should use
+// RegisterHandler or RegisterHandlerWithMeta.
+func RegisterMemoryHandler(name HandlerName, handler BaseHandler) error {
 	return RegisterHandlerWithMeta(name, handler, HandlerMeta{})
 }
 
 func RegisterHandlerWithMeta(name HandlerName, handler BaseHandler, meta HandlerMeta) error {
+	if meta.Rollback > RollbackUndo {
+		return fmt.Errorf("nest: invalid rollback policy %d", meta.Rollback)
+	}
+	if meta.Durability > DurabilityStrict {
+		return fmt.Errorf("nest: invalid durability policy %d", meta.Durability)
+	}
+	if meta.Durability != DurabilityMemory && meta.Rollback == RollbackNone {
+		return fmt.Errorf("%w: durable handler %q requires rollback", ErrRollbackUnsupported, name.String())
+	}
 	handlerMu.Lock()
 	defer handlerMu.Unlock()
 	if _, ok := handlerMap[name]; ok {
@@ -49,6 +66,12 @@ func RegisterHandlerWithMeta(name HandlerName, handler BaseHandler, meta Handler
 
 func MustRegisterHandler(name HandlerName, handler BaseHandler) {
 	if err := RegisterHandler(name, handler); err != nil {
+		panic(err)
+	}
+}
+
+func MustRegisterMemoryHandler(name HandlerName, handler BaseHandler) {
+	if err := RegisterMemoryHandler(name, handler); err != nil {
 		panic(err)
 	}
 }
@@ -71,6 +94,30 @@ func GetHandlerEntry(name HandlerName) (handlerEntry, bool) {
 	handlerMu.RLock()
 	defer handlerMu.RUnlock()
 	entry, ok := handlerMap[name]
+	if ok && entry.handler != nil {
+		entry.handler = hotcode.Resolve[BaseHandler](HandlerPatchName(name), entry.handler)
+	}
+	return entry, ok
+}
+
+func snapshotHandlerEntries() map[HandlerName]handlerEntry {
+	handlerMu.RLock()
+	defer handlerMu.RUnlock()
+	ret := make(map[HandlerName]handlerEntry, len(handlerMap))
+	for name, entry := range handlerMap {
+		ret[name] = entry
+	}
+	return ret
+}
+
+func (mgr *NestMgr) getHandlerEntry(name HandlerName) (handlerEntry, bool) {
+	if mgr == nil {
+		return handlerEntry{}, false
+	}
+	entry, ok := mgr.handlers[name]
+	if !ok {
+		return GetHandlerEntry(name)
+	}
 	if ok && entry.handler != nil {
 		entry.handler = hotcode.Resolve[BaseHandler](HandlerPatchName(name), entry.handler)
 	}
@@ -114,9 +161,14 @@ func NestDispatch(mgr *NestMgr, msg *Msg) {
 	if msg == nil {
 		return
 	}
+	if mgr == nil {
+		recycleMsg(msg)
+		return
+	}
+	msg.getter = mgr.getter
 	start := time.Now()
 	traceWatch := startSlowDispatchTraceWatch(msg, start)
-	releaseCtx := ensureNestContext(msg)
+	releaseCtx := ensureNestContext(mgr, msg)
 	_, releaseGuardScope := entity.NewGuardScope("nest:" + msg.Name)
 	releaseCurrentMsg := pushCurrentNestDispatchMsg(msg)
 	var err error
@@ -130,14 +182,20 @@ func NestDispatch(mgr *NestMgr, msg *Msg) {
 			}
 			slog.Error("nest dispatch panic", "err", err)
 		}
-		releaseCurrentMsg()
-		releaseGuardScope()
-		releaseCtx()
-		// Release remote entity locks after dispatch
-		if msg.RemoteRelease != nil {
-			msg.RemoteRelease()
-			msg.RemoteRelease = nil
+		if releaseErr := msg.releaseRemoteEntities(); releaseErr != nil {
+			err = errors.Join(err, fmt.Errorf("nest: release remote entities: %w", releaseErr))
 		}
+		releaseGuardScope()
+		msg.runAfterUnlock()
+		commitCtx := context.Background()
+		if current := ctx.CurrentContext(); current != nil && current.Base != nil {
+			commitCtx = current.Base
+		}
+		if remoteErr := msg.finishRemoteWriteBatch(commitCtx, err); remoteErr != nil {
+			err = errors.Join(err, fmt.Errorf("nest: finish remote write batch: %w", remoteErr))
+		}
+		releaseCurrentMsg()
+		releaseCtx()
 		if errors.Is(err, ErrEntityGroupTransitionScheduled) {
 			err = nil
 		}
@@ -164,39 +222,39 @@ func NestDispatch(mgr *NestMgr, msg *Msg) {
 	}()
 
 	emitNestTraceEvent(msg, "dispatch_start", "ok", 0)
+	if fenced := mgr.FenceError(); fenced != nil {
+		err = fenced
+		return
+	}
+	if current := ctx.CurrentContext(); current != nil && current.Base != nil {
+		select {
+		case <-current.Base.Done():
+			err = errors.Join(ErrNestCanceled, current.Base.Err())
+			return
+		default:
+		}
+	}
 
-	if err = prepareRemoteSnapshots(msg, mgr.remoteSnapshotResolver); err != nil {
+	if err = prepareRemoteSnapshots(msg, mgr.remoteSnapshotResolver, mgr.remoteManager); err != nil {
 		return
 	}
 
 	// Prepare remote entities (acquire distributed lock + load from DB)
 	if msg.HasRemote {
-		if err = prepareRemoteEntities(msg); err != nil {
+		if err = prepareRemoteWriteBatch(mgr.remoteManager, msg); err != nil {
 			return
 		}
 	}
 
 	switch msg.Type {
 	case MsgTypeSingle:
-		if msg.Cb1 != nil {
-			ret, err = mgr.anonymousSingleDispatch(msg.Name, msg.Tid, msg.Params, msg.Cb1)
-		} else {
-			ret, err = mgr.singleDispatch(msg.Name, msg.Tid, msg.Params)
-		}
+		ret, err = mgr.singleDispatch(msg.Name, msg.Tid, msg.Params)
 	case MsgTypeMulti:
-		if msg.Cb1 != nil {
-			ret, err = mgr.anonymousMultiDispatch(msg.Name, msg.Tids, msg.Params, msg.Cb1)
-		} else {
-			ret, err = mgr.multiDispatch(msg.Name, msg.Tids, msg.Params)
-		}
+		ret, err = mgr.multiDispatch(msg.Name, msg.Tids, msg.Params)
 	case MsgTypeMultiGroup:
 		ret, err = mgr.multiGroupDispatch(msg.Name, msg.GroupTIds, msg.Params)
 	case MsgTypeBroadcast:
-		if msg.Cb1 != nil {
-			mgr.anonymousBroadcastDispatch(msg.Name, msg.Tids, msg.Params, msg.Cb1)
-		} else {
-			mgr.broadcastDispatch(msg.Name, msg.Tids, msg.Params)
-		}
+		mgr.broadcastDispatch(msg.Name, msg.Tids, msg.Params)
 	case MsgTypeGroupTransition:
 		ret, err = mgr.groupTransitionDispatch(msg.GroupTransition)
 	}
@@ -315,7 +373,6 @@ type nestMsgDebugInfo struct {
 	ParamSamples []string
 	RefCount     int
 	HasRetChan   bool
-	HasCallback  bool
 	CostPool     bool
 	Remote       bool
 	ContextValid bool
@@ -342,7 +399,6 @@ func newNestMsgDebugInfo(msg *Msg) nestMsgDebugInfo {
 		ParamSamples: nestParamSamples(msg.Params),
 		RefCount:     msg.RefCount,
 		HasRetChan:   msg.RetChan != nil,
-		HasCallback:  msg.Cb1 != nil,
 		CostPool:     msg.Cost,
 		Remote:       msg.HasRemote,
 		ContextValid: msg.Context.Valid,
@@ -369,7 +425,6 @@ func (info nestMsgDebugInfo) fields() map[string]any {
 		"param_samples": info.ParamSamples,
 		"ref_count":     info.RefCount,
 		"has_ret_chan":  info.HasRetChan,
-		"has_callback":  info.HasCallback,
 		"cost_pool":     info.CostPool,
 		"remote":        info.Remote,
 		"context_valid": info.ContextValid,
@@ -553,12 +608,15 @@ func logAsyncDispatchError(msg *Msg, err error) {
 	)
 }
 
-func ensureNestContext(msg *Msg) func() {
+func ensureNestContext(mgr *NestMgr, msg *Msg) func() {
 	meta := ctx.RequestMeta{Source: "nest"}
 	if msg != nil {
 		meta.Handler = msg.Name
 	}
-	frame := CurTick()
+	frame := uint64(0)
+	if mgr != nil && mgr.ticker != nil {
+		frame = mgr.ticker.CurrentTick()
+	}
 	var opts []ctx.Option
 	if msg != nil && msg.Context.Valid {
 		opts = append(opts, ctx.WithSnapshot(msg.Context))
@@ -569,8 +627,15 @@ func ensureNestContext(msg *Msg) func() {
 	return release
 }
 
+func nestBaseContext() context.Context {
+	if current := ctx.CurrentContext(); current != nil && current.Base != nil {
+		return current.Base
+	}
+	return context.Background()
+}
+
 func (mgr *NestMgr) singleDispatch(name string, id int64, params []any) (any, error) {
-	entry, ok := GetHandlerEntry(NewHandlerName(name))
+	entry, ok := mgr.getHandlerEntry(NewHandlerName(name))
 	if !ok || entry.handler == nil {
 		return nil, ErrHandlerNotFound
 	}
@@ -579,7 +644,7 @@ func (mgr *NestMgr) singleDispatch(name string, id int64, params []any) (any, er
 		return nil, err
 	}
 	meta := entity.ResolveEntityID(fullID)
-	e, err := mgr.getter.Get(meta.FullID, meta.Category)
+	e, err := mgr.getter.Get(nestBaseContext(), meta.FullID, meta.Category)
 	if err != nil {
 		return nil, err
 	}
@@ -592,48 +657,18 @@ func (mgr *NestMgr) singleDispatch(name string, id int64, params []any) (any, er
 	if err := rejectPendingEntityGroupTransition(es); err != nil {
 		return nil, err
 	}
-	_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, es)
+	_, releaseLocks, err := lockDispatchEntitiesForHandlerWithStore(mgr.groupLockManager(), guard, es, groupStoreOf(mgr.getter))
 	if err != nil {
 		return nil, err
 	}
 	defer releaseLocks()
-	return invokeWithRollback(entry.meta, es, func() (any, error) {
+	return invokeWithTransaction(entry.meta, es, mgr.committer, name, func() (any, error) {
 		return entry.handler(es, params)
 	})
-}
-
-func (mgr *NestMgr) anonymousSingleDispatch(name string, id int64, params []any, cb func(es []any, params []any) (any, error)) (any, error) {
-	if cb == nil {
-		return nil, ErrHandlerNotFound
-	}
-	fullID, err := entity.NormalizeFullID(id, entity.EntityKindNone)
-	if err != nil {
-		return nil, err
-	}
-	meta := entity.ResolveEntityID(fullID)
-	e, err := mgr.getter.Get(meta.FullID, meta.Category)
-	if err != nil {
-		return nil, err
-	}
-	if !e.Touch() {
-		return nil, ErrEntityNotFound
-	}
-	defer e.UnTouch()
-	guard := entity.GetEntityGuard()
-	es := []entity.IThreadSafeEntity{e}
-	if err := rejectPendingEntityGroupTransition(es); err != nil {
-		return nil, err
-	}
-	_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, es)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseLocks()
-	return cb([]any{e}, params)
 }
 
 func (mgr *NestMgr) multiDispatch(name string, ids []int64, params []any) (any, error) {
-	entry, ok := GetHandlerEntry(NewHandlerName(name))
+	entry, ok := mgr.getHandlerEntry(NewHandlerName(name))
 	if !ok || entry.handler == nil {
 		return nil, ErrHandlerNotFound
 	}
@@ -641,7 +676,7 @@ func (mgr *NestMgr) multiDispatch(name string, ids []int64, params []any) (any, 
 	if err != nil {
 		return nil, err
 	}
-	es, err := mgr.getter.GetMany(fullIDs, fullIDCategories)
+	es, err := mgr.getter.GetMany(nestBaseContext(), fullIDs, fullIDCategories)
 	if err != nil {
 		return nil, err
 	}
@@ -674,72 +709,18 @@ func (mgr *NestMgr) multiDispatch(name string, ids []int64, params []any) (any, 
 
 	SortEntity(lockEs)
 	guard := entity.GetEntityGuard()
-	_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, lockEs)
+	_, releaseLocks, err := lockDispatchEntitiesForHandlerWithStore(mgr.groupLockManager(), guard, lockEs, groupStoreOf(mgr.getter))
 	if err != nil {
 		return nil, err
 	}
 	defer releaseLocks()
-	return invokeWithRollback(entry.meta, es, func() (any, error) {
+	return invokeWithTransaction(entry.meta, es, mgr.committer, name, func() (any, error) {
 		return entry.handler(es, params)
 	})
 }
 
-func (mgr *NestMgr) anonymousMultiDispatch(name string, ids []int64, params []any, cb func(es []any, params []any) (any, error)) (any, error) {
-	if cb == nil {
-		return nil, ErrHandlerNotFound
-	}
-	fullIDs, fullIDCategories, err := normalizeFullIDs(ids)
-	if err != nil {
-		return nil, err
-	}
-	es, err := mgr.getter.GetMany(fullIDs, fullIDCategories)
-	if err != nil {
-		return nil, err
-	}
-
-	var lockEs []entity.IThreadSafeEntity
-	var touchedEs []entity.IThreadSafeEntity
-	for i, e := range es {
-		if e != nil && e.Touch() {
-			lockEs = append(lockEs, e)
-			touchedEs = append(touchedEs, e)
-		} else {
-			es[i] = nil
-		}
-	}
-	defer func() {
-		for _, te := range touchedEs {
-			te.UnTouch()
-		}
-	}()
-
-	if firstDispatchEntityMissing(es) {
-		return nil, ErrEntityNotFound
-	}
-	if len(lockEs) == 0 {
-		return nil, ErrEntityNotFound
-	}
-	if err := rejectPendingEntityGroupTransition(lockEs); err != nil {
-		return nil, err
-	}
-
-	SortEntity(lockEs)
-	guard := entity.GetEntityGuard()
-	_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, lockEs)
-	if err != nil {
-		return nil, err
-	}
-	defer releaseLocks()
-
-	anyEs := make([]any, len(es))
-	for i, e := range es {
-		anyEs[i] = e
-	}
-	return cb(anyEs, params)
-}
-
 func (mgr *NestMgr) multiGroupDispatch(name string, groups [][]int64, params []any) (any, error) {
-	entry, ok := GetHandlerEntry(NewHandlerName(name))
+	entry, ok := mgr.getHandlerEntry(NewHandlerName(name))
 	if !ok || entry.handler == nil {
 		return nil, ErrHandlerNotFound
 	}
@@ -753,7 +734,7 @@ func (mgr *NestMgr) multiGroupDispatch(name string, groups [][]int64, params []a
 	if err != nil {
 		return nil, err
 	}
-	es, err := mgr.getter.GetMany(fullIDs, fullIDCategories)
+	es, err := mgr.getter.GetMany(nestBaseContext(), fullIDs, fullIDCategories)
 	if err != nil {
 		return nil, err
 	}
@@ -785,12 +766,12 @@ func (mgr *NestMgr) multiGroupDispatch(name string, groups [][]int64, params []a
 	}
 	SortEntity(lockEs)
 	guard := entity.GetEntityGuard()
-	_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, lockEs)
+	_, releaseLocks, err := lockDispatchEntitiesForHandlerWithStore(mgr.groupLockManager(), guard, lockEs, groupStoreOf(mgr.getter))
 	if err != nil {
 		return nil, err
 	}
 	defer releaseLocks()
-	return invokeWithRollback(entry.meta, es, func() (any, error) {
+	return invokeWithTransaction(entry.meta, es, mgr.committer, name, func() (any, error) {
 		return entry.handler(es, params, HandlerOptionWithGroup(groupLen))
 	})
 }
@@ -873,7 +854,7 @@ func releaseDispatchEntities(guard *entity.EntityGuard, acquired []entity.IThrea
 }
 
 func (mgr *NestMgr) broadcastDispatch(name string, ids []int64, params []any) {
-	entry, ok := GetHandlerEntry(NewHandlerName(name))
+	entry, ok := mgr.getHandlerEntry(NewHandlerName(name))
 	if !ok || entry.handler == nil {
 		return
 	}
@@ -887,7 +868,7 @@ func (mgr *NestMgr) broadcastDispatch(name string, ids []int64, params []any) {
 			continue
 		}
 		meta := entity.ResolveEntityID(fullID)
-		e, err := mgr.getter.Get(meta.FullID, meta.Category)
+		e, err := mgr.getter.Get(nestBaseContext(), meta.FullID, meta.Category)
 		if err != nil {
 			continue
 		}
@@ -908,52 +889,10 @@ func (mgr *NestMgr) broadcastDispatch(name string, ids []int64, params []any) {
 				e.UnTouch()
 			}()
 			oneEntity[0] = e
-			if _, err := invokeWithRollback(entry.meta, oneEntity, func() (any, error) {
+			if _, err := invokeWithTransaction(entry.meta, oneEntity, mgr.committer, name, func() (any, error) {
 				return entry.handler(oneEntity, params)
 			}); err != nil {
 				slog.Debug("nest broadcast handler failed", "id", meta.FullID, "handler", name, "err", err)
-			}
-		}()
-	}
-}
-
-func (mgr *NestMgr) anonymousBroadcastDispatch(name string, ids []int64, params []any, cb func(es []any, params []any) (any, error)) {
-	if cb == nil {
-		return
-	}
-	guard := entity.GetEntityGuard()
-	defer entity.EntityGuardRelease(guard)
-
-	oneEntity := make([]any, 1)
-	for _, id := range ids {
-		fullID, err := entity.NormalizeFullID(id, entity.EntityKindNone)
-		if err != nil {
-			continue
-		}
-		meta := entity.ResolveEntityID(fullID)
-		e, err := mgr.getter.Get(meta.FullID, meta.Category)
-		if err != nil {
-			continue
-		}
-		if !e.Touch() {
-			continue
-		}
-		if !guard.RequireEntity(e) {
-			e.UnTouch()
-			continue
-		}
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					slog.Error("nest anonymous broadcast panic", "id", meta.FullID, "handler", name, "err", r)
-				}
-				oneEntity[0] = nil
-				guard.ReleaseEntity(e.GUId())
-				e.UnTouch()
-			}()
-			oneEntity[0] = e
-			if _, err := cb(oneEntity, params); err != nil {
-				slog.Debug("nest anonymous broadcast callback failed", "id", meta.FullID, "handler", name, "err", err)
 			}
 		}()
 	}
@@ -999,21 +938,33 @@ func cmpGuidFunc(guidI, guidJ int64) bool {
 	return guidI < guidJ
 }
 
-// prepareRemoteEntities calls the application-layer hook to acquire distributed locks
-// and load remote entities before dispatch.
-func prepareRemoteEntities(msg *Msg) error {
+// prepareRemoteWriteBatch admits one fenced transaction before dispatch.
+func prepareRemoteWriteBatch(manager entity.IRemoteEntityManager, msg *Msg) error {
 	ids := extractRemoteIds(msg)
 	if len(ids) == 0 {
 		return nil
 	}
-	release, ok, err := entity.PrepareRemoteEntities(ids)
-	if !ok {
-		return nil
+	// A remote write batch is one transaction. Broadcast invokes one
+	// transaction per entity and therefore cannot provide a matching atomic
+	// commit/rollback boundary for the batch.
+	if msg.Type == MsgTypeBroadcast {
+		return ErrRemoteBroadcastUnsupported
 	}
+	prepareCtx := context.Background()
+	if current := ctx.CurrentContext(); current != nil && current.Base != nil {
+		prepareCtx = current.Base
+	}
+	if manager == nil {
+		return entity.ErrRemoteWriteCapabilityDisabled
+	}
+	batch, err := manager.PrepareRemoteWriteBatch(prepareCtx, ids)
 	if err != nil {
 		return err
 	}
-	msg.RemoteRelease = release
+	if batch == nil {
+		return entity.ErrRemoteWriteCapabilityDisabled
+	}
+	msg.setRemoteWriteBatch(batch)
 	return nil
 }
 

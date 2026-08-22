@@ -35,26 +35,40 @@ type EntityBase struct {
 	groupEpoch     atomic.Uint64
 	groupState     atomic.Int32
 	groupTargetID  atomic.Int64
+	owner          atomic.Pointer[EntityManager]
 
 	// Event bus for pub/sub capability.
 	eventBus *event.EventBus
 	syncMu   sync.RWMutex
-	sync     *EntitySyncState
+	sync     *SubjectSyncState
 
 	// Lifecycle hooks — set by generated entity factory code.
 	onClear   func()
 	onDestroy func(EntityDestroyReason)
 }
 
+func (e *EntityBase) setOwner(owner *EntityManager) {
+	if e != nil {
+		e.owner.Store(owner)
+	}
+}
+
+func (e *EntityBase) owningManager() *EntityManager {
+	if e == nil {
+		return nil
+	}
+	return e.owner.Load()
+}
+
 // NewEntityBase creates an EntityBase. The id must be a full EntityID; use
 // EntityCreateParam.NormalizeID at construction boundaries that still receive a
 // generated unique ID. Hooks are set separately via SetHooks.
-// The mutex is obtained from lock.Mgr if set, otherwise a default reentrant mutex is created.
 func NewEntityBase(id int64, category EntityCategory, notAutoPersist bool, kinds ...EntityKind) *EntityBase {
-	var mu lock.Mutex
-	if lock.Mgr != nil {
-		mu = lock.Mgr.GetLock(id)
-	} else {
+	return NewEntityBaseWithMutex(id, category, notAutoPersist, lock.NewReentrantMutex(id), kinds...)
+}
+
+func NewEntityBaseWithMutex(id int64, category EntityCategory, notAutoPersist bool, mu lock.Mutex, kinds ...EntityKind) *EntityBase {
+	if mu == nil {
 		mu = lock.NewReentrantMutex(id)
 	}
 	kind := EntityKindNone
@@ -114,11 +128,13 @@ func (e *EntityBase) EnableSync(param EntitySyncCreateParam) {
 	if param.EntityID == 0 {
 		param.EntityID = e.id
 	}
-	syncState := NewEntitySyncState(param)
-	e.SetSyncState(syncState)
+	e.SetSyncState(NewSubjectSyncState(SubjectSyncCreateParam{
+		Enabled: param.Enabled, SubjectID: param.EntityID, Namespace: param.Topic,
+		SubjectKind: param.EntityKind, Packer: param.Packer,
+	}))
 }
 
-func (e *EntityBase) SetSyncState(syncState *EntitySyncState) {
+func (e *EntityBase) SetSyncState(syncState *SubjectSyncState) {
 	if e == nil {
 		return
 	}
@@ -129,8 +145,16 @@ func (e *EntityBase) SetSyncState(syncState *EntitySyncState) {
 		return
 	}
 	if syncState != nil {
-		syncState.setPackerWrapper(func(packer EntitySyncPacker) EntitySyncPacker {
-			return newLockedEntitySyncPacker(e, packer)
+		syncState.setEntityLock(func(fn func() error) error {
+			if fn == nil {
+				return nil
+			}
+			if entitySyncLockedInCurrentGuard(e.ID()) || e.GetMutex() == nil {
+				return fn()
+			}
+			e.GetMutex().Lock()
+			defer e.GetMutex().Unlock()
+			return fn()
 		})
 	}
 	e.sync = syncState
@@ -140,7 +164,7 @@ func (e *EntityBase) SetSyncState(syncState *EntitySyncState) {
 	}
 }
 
-func (e *EntityBase) Sync() *EntitySyncState {
+func (e *EntityBase) Sync() *SubjectSyncState {
 	if e == nil {
 		return nil
 	}
@@ -165,44 +189,6 @@ func (e *EntityBase) MarkSyncDirty(mask uint64) {
 func (e *EntityBase) MarkSyncFullDirty(reason uint32) {
 	if syncState := e.Sync(); syncState != nil {
 		syncState.MarkFullDirty(reason)
-	}
-}
-
-func (e *EntityBase) FlushSync() []SyncPacket {
-	if syncState := e.Sync(); syncState != nil {
-		return syncState.Flush()
-	}
-	return nil
-}
-
-func (e *EntityBase) FlushSyncTo(sink EntitySyncSink) []SyncPacket {
-	if syncState := e.Sync(); syncState != nil {
-		return syncState.FlushTo(sink)
-	}
-	return nil
-}
-
-// FlushSyncNow bypasses the configured minimum interval while preserving
-// stream serialization and entity-lock protected packing.
-func (e *EntityBase) FlushSyncNow() []SyncPacket {
-	if syncState := e.Sync(); syncState != nil {
-		return syncState.FlushNow()
-	}
-	return nil
-}
-
-func (e *EntityBase) FlushSyncNowTo(sink EntitySyncSink) []SyncPacket {
-	if syncState := e.Sync(); syncState != nil {
-		return syncState.FlushNowTo(sink)
-	}
-	return nil
-}
-
-// RequestSyncFlush schedules this entity for a post-release asynchronous
-// flush. Business handlers need not manage the entity mutex.
-func (e *EntityBase) RequestSyncFlush() {
-	if syncState := e.Sync(); syncState != nil {
-		syncState.RequestFlush()
 	}
 }
 
@@ -389,6 +375,7 @@ func (e *EntityBase) doClear() {
 	e.groupEpoch.Store(0)
 	e.groupState.Store(int32(EntityGroupTransitionNone))
 	e.groupTargetID.Store(0)
+	e.owner.Store(nil)
 	e.onClear = nil
 	e.onDestroy = nil
 }

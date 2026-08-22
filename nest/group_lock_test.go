@@ -1,6 +1,7 @@
 package nest
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
@@ -11,10 +12,6 @@ import (
 func TestEntityLockGroupScopeAvailableForGroupedDispatch(t *testing.T) {
 	ResetHandlersForTest()
 	defer ResetHandlersForTest()
-
-	prevMgr := entity.Mgr
-	entity.Mgr = entity.NewEntityManager()
-	t.Cleanup(func() { entity.Mgr = prevMgr })
 
 	getter := newMockGetter()
 	groupID := int64(7001)
@@ -27,15 +24,15 @@ func TestEntityLockGroupScopeAvailableForGroupedDispatch(t *testing.T) {
 	e1.Base().SetGroupLockIDForTest(groupID)
 	e2.Base().SetGroupLockIDForTest(groupID)
 	otherGroup.Base().SetGroupLockIDForTest(groupID + 1)
-	entity.Mgr.Add(e1)
-	entity.Mgr.Add(e2)
-	entity.Mgr.Add(otherGroup)
+	getter.groups.Add(e1)
+	getter.groups.Add(e2)
+	getter.groups.Add(otherGroup)
 	getter.Add(e1)
 	getter.Add(e2)
 	getter.Add(otherGroup)
 
 	name := NewHandlerName("test_entity_lock_group_scope_available")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		scope := CurrentEntityLockGroup()
 		if scope == nil {
 			return nil, errors.New("missing group scope")
@@ -79,7 +76,7 @@ func TestEntityLockGroupScopeNilForNormalDispatch(t *testing.T) {
 	getter.Add(e)
 
 	name := NewHandlerName("test_entity_lock_group_scope_nil")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		if CurrentEntityLockGroup() != nil {
 			return nil, errors.New("normal dispatch should not have group scope")
 		}
@@ -126,6 +123,7 @@ func TestEntityLockGroupSnapshotDetectsPendingTransition(t *testing.T) {
 }
 
 func TestLockDispatchEntitiesForHandlerRetriesEpochChangeWhileWaiting(t *testing.T) {
+	locks := newEntityLockGroupLockManager()
 	id := mustBuildCastID(t, 4213, entity.EntityCategory(1), nestLocalKind)
 	e := newMockEntity(id, entity.EntityCategory(1))
 	mu := e.GetMutex()
@@ -134,7 +132,7 @@ func TestLockDispatchEntitiesForHandlerRetriesEpochChangeWhileWaiting(t *testing
 	done := make(chan error, 1)
 	go func() {
 		guard := entity.GetEntityGuard()
-		_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, []entity.IThreadSafeEntity{e})
+		_, releaseLocks, err := lockDispatchEntitiesForHandler(locks, guard, []entity.IThreadSafeEntity{e})
 		if err == nil {
 			scope := CurrentEntityLockGroup()
 			if scope == nil || scope.GroupID() != 9103 {
@@ -163,6 +161,7 @@ func TestLockDispatchEntitiesForHandlerRetriesEpochChangeWhileWaiting(t *testing
 }
 
 func TestLockDispatchEntitiesForHandlerDoesNotBlockGroupOnBusyExtraEntity(t *testing.T) {
+	locks := newEntityLockGroupLockManager()
 	groupID := int64(9201)
 	groupedID := mustBuildCastID(t, 4221, entity.EntityCategory(1), nestLocalKind)
 	extraID := mustBuildCastID(t, 4222, entity.EntityCategory(1), nestLocalKind)
@@ -184,7 +183,7 @@ func TestLockDispatchEntitiesForHandlerDoesNotBlockGroupOnBusyExtraEntity(t *tes
 	done := make(chan error, 1)
 	go func() {
 		guard := entity.GetEntityGuard()
-		_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, []entity.IThreadSafeEntity{grouped, extra})
+		_, releaseLocks, err := lockDispatchEntitiesForHandler(locks, guard, []entity.IThreadSafeEntity{grouped, extra})
 		if err == nil {
 			releaseLocks()
 		}
@@ -202,6 +201,7 @@ func TestLockDispatchEntitiesForHandlerDoesNotBlockGroupOnBusyExtraEntity(t *tes
 }
 
 func TestLockDispatchEntitiesForHandlerDoesNotBlockOnBusyGroupLock(t *testing.T) {
+	locks := newEntityLockGroupLockManager()
 	groupID := int64(9203)
 	groupedID := mustBuildCastID(t, 4241, entity.EntityCategory(1), nestLocalKind)
 	grouped := newMockEntity(groupedID, entity.EntityCategory(1))
@@ -210,11 +210,14 @@ func TestLockDispatchEntitiesForHandlerDoesNotBlockOnBusyGroupLock(t *testing.T)
 	groupLocked := make(chan struct{})
 	releaseGroup := make(chan struct{})
 	go func() {
-		mu := entityLockGroupMutex(groupID)
-		mu.Lock()
+		entry, ok := locks.acquire(groupID)
+		if !ok {
+			t.Error("acquire group lock")
+			return
+		}
 		close(groupLocked)
 		<-releaseGroup
-		mu.Unlock()
+		locks.release(entry)
 	}()
 	<-groupLocked
 	defer close(releaseGroup)
@@ -222,7 +225,7 @@ func TestLockDispatchEntitiesForHandlerDoesNotBlockOnBusyGroupLock(t *testing.T)
 	done := make(chan error, 1)
 	go func() {
 		guard := entity.GetEntityGuard()
-		_, releaseLocks, err := lockDispatchEntitiesForHandler(guard, []entity.IThreadSafeEntity{grouped})
+		_, releaseLocks, err := lockDispatchEntitiesForHandler(locks, guard, []entity.IThreadSafeEntity{grouped})
 		if err == nil {
 			releaseLocks()
 		}
@@ -258,7 +261,7 @@ func TestEntityLockGroupDispatchRequeuesBusyGroupLock(t *testing.T) {
 	defer StopNest()
 
 	name := NewHandlerName("test_entity_lock_group_requeue_busy_group")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		if len(es) != 1 || es[0] != grouped {
 			return nil, errors.New("dispatch entity mismatch")
 		}
@@ -272,11 +275,14 @@ func TestEntityLockGroupDispatchRequeuesBusyGroupLock(t *testing.T) {
 	groupLocked := make(chan struct{})
 	releaseGroup := make(chan struct{})
 	go func() {
-		mu := entityLockGroupMutex(groupID)
-		mu.Lock()
+		entry, ok := Nest.groupLocks.acquire(groupID)
+		if !ok {
+			t.Error("acquire group lock")
+			return
+		}
 		close(groupLocked)
 		<-releaseGroup
-		mu.Unlock()
+		Nest.groupLocks.release(entry)
 	}()
 	<-groupLocked
 
@@ -286,7 +292,7 @@ func TestEntityLockGroupDispatchRequeuesBusyGroupLock(t *testing.T) {
 	}
 	done := make(chan syncResult, 1)
 	go func() {
-		ret, err := Nest.Sync(name, groupedID, nil)
+		ret, err := Nest.Request(context.Background(), name, groupedID, nil)
 		done <- syncResult{ret: ret, err: err}
 	}()
 
@@ -333,7 +339,7 @@ func TestEntityLockGroupDispatchRequeuesBusyExtraEntity(t *testing.T) {
 	defer StopNest()
 
 	name := NewHandlerName("test_entity_lock_group_requeue_busy_extra")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		if len(es) != 2 || es[0] != grouped || es[1] != extra {
 			return nil, errors.New("dispatch entities mismatch")
 		}
@@ -360,7 +366,7 @@ func TestEntityLockGroupDispatchRequeuesBusyExtraEntity(t *testing.T) {
 	}
 	done := make(chan syncResult, 1)
 	go func() {
-		ret, err := Nest.MultiSync(name, []int64{groupedID, extraID}, nil)
+		ret, err := Nest.RequestMulti(context.Background(), name, []int64{groupedID, extraID}, nil)
 		done <- syncResult{ret: ret, err: err}
 	}()
 

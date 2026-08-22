@@ -13,9 +13,8 @@ const (
 const DirtyAll uint64 = ^uint64(0)
 
 // DirtyTracker tracks field-level dirty masks separately for persistence and
-// cross-server sync. Snapshotting happens under entity lock, so no flushing mask
-// is needed: persist failures mark the whole DAO dirty for the next low-frequency
-// flush, while sync failures restore only the sampled sync mask.
+// cross-server sync. Take uses an atomic exchange: bits marked after a snapshot
+// land in the new active mask and cannot be cleared by an older acknowledgement.
 type DirtyTracker struct {
 	persistDirty atomic.Uint64
 	syncDirty    atomic.Uint64
@@ -80,8 +79,8 @@ func (d *DirtyTracker) TakeSyncDirty() uint64 {
 
 func (d *DirtyTracker) CommitPersist(_ uint64) {}
 
-func (d *DirtyTracker) RollbackPersist(_ uint64) {
-	d.persistDirty.Or(DirtyAll)
+func (d *DirtyTracker) RollbackPersist(mask uint64) {
+	d.MarkPersist(mask)
 }
 
 func (d *DirtyTracker) CommitSync(_ uint64) {}

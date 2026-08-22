@@ -187,6 +187,42 @@ func TestRedisSnapshotWALSubmitDurableWritesImmediatelyWithoutWorker(t *testing.
 	}
 }
 
+func TestRedisSnapshotWALDurableDeleteReplaysTombstone(t *testing.T) {
+	ctx := context.Background()
+	redis := newSnapshotWALFakeRedis()
+	wal := NewRedisSnapshotWAL(redis, RedisSnapshotWALConfig{
+		Prefix: "cube:test:wal", Shards: 2, ReplayBatchSize: 10,
+	})
+	item := SaveItem{Db: "game_1", DbScope: DatabaseScopeServer, Collection: "players", ID: 1001, Version: 9}
+	if ok := wal.SubmitDeleteDurable(ctx, []SaveItem{item}); !ok {
+		t.Fatal("SubmitDeleteDurable returned false")
+	}
+	target := redisSnapshotWALTarget(item)
+	shard := redisSnapshotWALShard(target, 2)
+	raw := redis.hashes[redisSnapshotWALSnapshotKey("cube:test:wal", shard)][target]
+	var payload redisSnapshotWALPayload
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Operation != redisSnapshotWALOperationDelete || payload.DbScope != DatabaseScopeServer || len(payload.Data) != 0 {
+		t.Fatalf("delete WAL payload = %+v", payload)
+	}
+	backend := &mockBackend{}
+	if err := wal.Replay(ctx, backend); err != nil {
+		t.Fatal(err)
+	}
+	backend.mu.Lock()
+	removed := append([]RemoveOp(nil), backend.removed...)
+	backend.mu.Unlock()
+	if len(removed) != 1 || removed[0].Db != "game_1" || removed[0].DbScope != DatabaseScopeServer ||
+		removed[0].Collection != "players" || len(removed[0].IDs) != 1 || removed[0].IDs[0] != 1001 {
+		t.Fatalf("replayed removes = %+v", removed)
+	}
+	if _, ok := redis.hashes[redisSnapshotWALSnapshotKey("cube:test:wal", shard)][target]; ok {
+		t.Fatal("replayed delete tombstone was not acknowledged")
+	}
+}
+
 func TestRedisSnapshotWALRecordsObsMetrics(t *testing.T) {
 	obs.DefaultRegistry().Reset()
 	t.Cleanup(func() { obs.DefaultRegistry().Reset() })

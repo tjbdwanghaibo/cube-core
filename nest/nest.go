@@ -7,21 +7,25 @@ import (
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/entity"
 	"log/slog"
+	"sync"
 	"time"
 )
-
-var Nest *NestMgr
 
 const NestSyncTimeout = 5 * time.Second
 
 var (
 	ErrHandlerNotFound                = errors.New("nest: handler not found")
+	ErrInvalidMessage                 = errors.New("nest: invalid message")
+	ErrGetterNotSet                   = errors.New("nest: entity getter not set")
+	ErrQueueFull                      = errors.New("nest: dispatch queue full")
 	ErrEntityNotFound                 = errors.New("nest: entity not found")
 	ErrEntityTypeMismatch             = errors.New("nest: entity type mismatch")
 	ErrLockTimeout                    = errors.New("nest: lock timeout")
 	ErrNestTimeout                    = errors.New("nest: sync timeout")
 	ErrNestCanceled                   = errors.New("nest: sync canceled")
 	ErrNestStopped                    = errors.New("nest: stopped")
+	ErrNestFenced                     = errors.New("nest: admission fenced")
+	ErrDelayTooLong                   = errors.New("nest: delayed dispatch exceeds maximum delay")
 	ErrParamMismatch                  = errors.New("nest: param mismatch")
 	ErrAsyncInHandler                 = errors.New("nest: async dispatch from nest handler")
 	ErrSyncInHandler                  = errors.New("nest: sync dispatch from nest handler")
@@ -30,10 +34,30 @@ var (
 	ErrEntityGroupTransitionPending   = errors.New("nest: entity group transition pending")
 	ErrEntityGroupTransitionScheduled = errors.New("nest: entity group transition scheduled")
 	ErrInvalidEntityLockGroup         = errors.New("nest: invalid entity lock group")
+	ErrRollbackUnsupported            = errors.New("nest: rollback is not supported by all participants")
+	ErrRollbackFailed                 = errors.New("nest: rollback failed")
+	ErrTransactionClosed              = errors.New("nest: transaction is already closed")
+	ErrCommitterRequired              = errors.New("nest: durable transaction committer is required")
+	ErrDurableRemoteWriteUnsupported  = errors.New("nest: durable remote write requires a lease-aware WAL committer")
+	ErrRemoteBroadcastUnsupported     = errors.New("nest: remote-managed entities cannot use broadcast dispatch")
+	ErrCommitRejected                 = errors.New("nest: transaction commit rejected")
+	// ErrCommitIndeterminate means the storage device returned an error after
+	// commit bytes may have reached durable media. The process must be fenced
+	// and recovered from WAL; rolling the in-memory state back could create a
+	// second, conflicting history.
+	ErrCommitIndeterminate = errors.New("nest: transaction commit outcome is indeterminate")
 )
 
 func NewParamCountMismatchError(handler string, got int, want int) error {
 	return fmt.Errorf("%w: handler=%s got=%d want=%d", ErrParamMismatch, handler, got, want)
+}
+
+func NewEntityCountMismatchError(handler string, got int, want int) error {
+	return fmt.Errorf("%w: handler=%s entities=%d want=%d", ErrEntityTypeMismatch, handler, got, want)
+}
+
+func NewResultTypeMismatchError(handler string, want string, got any) error {
+	return fmt.Errorf("%w: handler=%s result want=%s got=%T", ErrParamMismatch, handler, want, got)
 }
 
 func NewParamTypeMismatchError(handler string, idx int, want string, got any) error {
@@ -45,6 +69,58 @@ type NestMgr struct {
 	ticker                 *Ticker
 	getter                 entity.Getter
 	remoteSnapshotResolver RemoteSnapshotResolver
+	remoteManager          entity.IRemoteEntityManager
+	committer              TransactionCommitter
+	syncTimeout            time.Duration
+	lifecycleMu            sync.Mutex
+	started                bool
+	stopped                bool
+	stopDone               chan struct{}
+	stopErr                error
+	fenceErr               error
+	groupLocks             *entityLockGroupLockManager
+	handlers               map[HandlerName]handlerEntry
+}
+
+func (mgr *NestMgr) groupLockManager() *entityLockGroupLockManager {
+	if mgr == nil {
+		return nil
+	}
+	mgr.lifecycleMu.Lock()
+	if mgr.groupLocks == nil {
+		mgr.groupLocks = newEntityLockGroupLockManager()
+	}
+	locks := mgr.groupLocks
+	mgr.lifecycleMu.Unlock()
+	return locks
+}
+
+// Fence immediately rejects new and queued dispatches without attempting to
+// roll back any transaction whose durable outcome is indeterminate. It is
+// idempotent and is intentionally separate from Shutdown so in-flight handlers
+// can finish their fail-stop paths before the application drains workers.
+func (mgr *NestMgr) Fence(cause error) {
+	if mgr == nil || cause == nil {
+		return
+	}
+	mgr.lifecycleMu.Lock()
+	if mgr.fenceErr == nil {
+		mgr.fenceErr = errors.Join(ErrNestFenced, cause)
+	}
+	fenced := mgr.fenceErr
+	mgr.lifecycleMu.Unlock()
+	if mgr.dispatcher != nil {
+		mgr.dispatcher.Fence(fenced)
+	}
+}
+
+func (mgr *NestMgr) FenceError() error {
+	if mgr == nil {
+		return ErrNestStopped
+	}
+	mgr.lifecycleMu.Lock()
+	defer mgr.lifecycleMu.Unlock()
+	return mgr.fenceErr
 }
 
 type HandlerName struct {
@@ -52,9 +128,6 @@ type HandlerName struct {
 }
 
 type Params []any
-
-type SingleCallback func(e any, params Params) (any, error)
-type MultiCallback func(es []any, params Params) (any, error)
 
 func NewHandlerName(value string) HandlerName {
 	return HandlerName{value: value}
@@ -78,10 +151,15 @@ func (mgr *NestMgr) TickDuration() time.Duration {
 type NestOpts struct {
 	Getter                 entity.Getter
 	RemoteSnapshotResolver RemoteSnapshotResolver
+	RemoteManager          entity.IRemoteEntityManager
 	WorkerNum              int
 	HbWorkerNum            int
 	MsgCap                 int
+	DelayedMsgCap          int
+	MaxDelay               time.Duration
 	TickDuration           time.Duration
+	SyncTimeout            time.Duration
+	Committer              TransactionCommitter
 }
 
 type NestOption func(*NestOpts)
@@ -97,6 +175,11 @@ var (
 			opts.RemoteSnapshotResolver = resolver
 		}
 	}
+	NestOptionWithRemoteEntityManager = func(manager entity.IRemoteEntityManager) NestOption {
+		return func(opts *NestOpts) {
+			opts.RemoteManager = manager
+		}
+	}
 	NestOptionWithWorkerNumAndMsgCap = func(workerNum, hbWorkerNum, msgCap int) NestOption {
 		return func(opts *NestOpts) {
 			opts.WorkerNum = workerNum
@@ -104,60 +187,145 @@ var (
 			opts.MsgCap = msgCap
 		}
 	}
+	NestOptionWithDelayedAdmission = func(capacity int, maxDelay time.Duration) NestOption {
+		return func(opts *NestOpts) {
+			opts.DelayedMsgCap = capacity
+			opts.MaxDelay = maxDelay
+		}
+	}
 	NestOptionWithTickDuration = func(tickDuration time.Duration) NestOption {
 		return func(opts *NestOpts) {
 			opts.TickDuration = tickDuration
 		}
 	}
-)
-
-func InitNest(opts ...NestOption) {
-	params := &NestOpts{}
-	for _, opt := range opts {
-		opt(params)
-	}
-	var ret *NestMgr
-	dis := NewDispatcher("nest", params.WorkerNum, params.HbWorkerNum, params.MsgCap, func(msg *Msg) {
-		NestDispatch(ret, msg)
-	})
-	tk := NewTicker(params.TickDuration)
-	ret = &NestMgr{dispatcher: dis, ticker: tk, remoteSnapshotResolver: params.RemoteSnapshotResolver}
-	ret.getter = params.Getter
-	Nest = ret
-	InitGlobalGetter(params.Getter)
-	dis.OnInit()
-	dis.OnRun()
-	tk.Start()
-
-	entity.SendMsg = func(msg any) {
-		if m, ok := msg.(*Msg); ok {
-			ret.dispatcher.SendMsg(m)
+	NestOptionWithSyncTimeout = func(timeout time.Duration) NestOption {
+		return func(opts *NestOpts) {
+			opts.SyncTimeout = timeout
 		}
 	}
-}
-
-func StopNest() {
-	if err := StopNestWithContext(context.Background()); err != nil {
-		slog.Warn("nest stop interrupted", "err", err)
+	NestOptionWithTransactionCommitter = func(committer TransactionCommitter) NestOption {
+		return func(opts *NestOpts) {
+			opts.Committer = committer
+		}
 	}
+)
+
+// NewEngine constructs an instance-scoped Nest engine. Callers inject its
+// Client into generated senders. An engine is single-use and cannot be
+// restarted after Shutdown.
+func NewEngine(opts ...NestOption) *NestMgr {
+	params := &NestOpts{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(params)
+		}
+	}
+	ret := &NestMgr{
+		getter:                 params.Getter,
+		remoteSnapshotResolver: params.RemoteSnapshotResolver,
+		remoteManager:          params.RemoteManager,
+		committer:              params.Committer,
+		syncTimeout:            params.SyncTimeout,
+		stopDone:               make(chan struct{}),
+		groupLocks:             newEntityLockGroupLockManager(),
+		handlers:               snapshotHandlerEntries(),
+	}
+	if ret.syncTimeout <= 0 {
+		ret.syncTimeout = NestSyncTimeout
+	}
+	ret.dispatcher = NewDispatcher("nest", params.WorkerNum, params.HbWorkerNum, params.MsgCap, func(msg *Msg) {
+		NestDispatch(ret, msg)
+	})
+	ret.dispatcher.ConfigureDelayedAdmission(params.DelayedMsgCap, params.MaxDelay)
+	ret.ticker = NewTicker(params.TickDuration)
+	return ret
 }
 
-func StopNestWithContext(ctx context.Context) error {
+// Start starts the worker pools and frame ticker. Repeated calls before
+// Shutdown are harmless.
+func (mgr *NestMgr) Start() error {
+	if mgr == nil {
+		return ErrNestStopped
+	}
+	mgr.lifecycleMu.Lock()
+	defer mgr.lifecycleMu.Unlock()
+	if mgr.stopped {
+		return ErrNestStopped
+	}
+	if mgr.started {
+		return nil
+	}
+	if mgr.getter == nil {
+		return ErrGetterNotSet
+	}
+	mgr.dispatcher.OnInit()
+	mgr.dispatcher.OnRun()
+	mgr.ticker.Start()
+	mgr.started = true
+	return nil
+}
+
+// Shutdown stops admission, drains accepted work and stops the ticker. It is
+// safe for concurrent callers; all callers observe the same result.
+func (mgr *NestMgr) Shutdown(ctx context.Context) error {
+	if mgr == nil {
+		return nil
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	var err error
-	if Nest != nil {
-		mgr := Nest
-		mgr.ticker.Stop()
-		err = mgr.dispatcher.OnDestroyWithContext(ctx)
-		if err == nil {
-			Nest = nil
-			InitGlobalGetter(nil)
-			entity.SendMsg = nil
-		}
+	mgr.lifecycleMu.Lock()
+	if mgr.stopped {
+		done := mgr.stopDone
+		mgr.lifecycleMu.Unlock()
+		return mgr.waitStopped(ctx, done)
 	}
-	return err
+	mgr.stopped = true
+	started := mgr.started
+	done := mgr.stopDone
+	mgr.lifecycleMu.Unlock()
+
+	if !started {
+		mgr.finishShutdown(nil)
+		return nil
+	}
+	// Once shutdown starts, accepted work must finish even if one caller's
+	// deadline expires. This prevents a second engine from starting while old
+	// workers still mutate entities. The caller's context bounds only its wait.
+	go func() {
+		mgr.ticker.Stop()
+		mgr.finishShutdown(mgr.dispatcher.OnDestroyWithContext(context.Background()))
+	}()
+	return mgr.waitStopped(ctx, done)
+}
+
+func (mgr *NestMgr) waitStopped(ctx context.Context, done <-chan struct{}) error {
+	select {
+	case <-done:
+		mgr.lifecycleMu.Lock()
+		err := mgr.stopErr
+		mgr.lifecycleMu.Unlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (mgr *NestMgr) finishShutdown(err error) {
+	mgr.lifecycleMu.Lock()
+	mgr.stopErr = err
+	close(mgr.stopDone)
+	mgr.lifecycleMu.Unlock()
+}
+
+// Running reports whether Start completed and Shutdown has not begun.
+func (mgr *NestMgr) Running() bool {
+	if mgr == nil {
+		return false
+	}
+	mgr.lifecycleMu.Lock()
+	defer mgr.lifecycleMu.Unlock()
+	return mgr.started && !mgr.stopped && mgr.fenceErr == nil
 }
 
 type sendOptParam struct {
@@ -238,245 +406,6 @@ func bindMsgContext(msg *Msg, carryBase bool) {
 	msg.Context = snapshot
 }
 
-func (mgr *NestMgr) AnonymousSend(name HandlerName, id int64, params Params, cb SingleCallback, opts ...SendOpt) {
-	if mgr == nil || cb == nil {
-		return
-	}
-	ensureAsyncDispatchAllowed("AnonymousSend", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg := GenMsg(MsgTypeSingle)
-	msg.Tid = id
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cb1 = func(es []any, params []any) (any, error) {
-		if len(es) != 1 {
-			return nil, errors.New("invalid msg type")
-		}
-		return cb(es[0], Params(params))
-	}
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, false)
-	checkRemoteId(msg, id)
-
-	if optP.Delay > 0 {
-		mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-	} else {
-		mgr.dispatcher.SendMsg(msg)
-	}
-}
-
-func (mgr *NestMgr) AnonymousMultiSend(name HandlerName, ids []int64, params Params, cb MultiCallback, opts ...SendOpt) {
-	if mgr == nil || cb == nil || len(ids) == 0 {
-		return
-	}
-	ensureAsyncDispatchAllowed("AnonymousMultiSend", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg := GenMsg(MsgTypeMulti)
-	msg.Tids = ids
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cb1 = func(es []any, params []any) (any, error) {
-		return cb(es, Params(params))
-	}
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, false)
-	checkRemoteIds(msg, ids)
-
-	if optP.Delay > 0 {
-		mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-	} else {
-		mgr.dispatcher.SendMsg(msg)
-	}
-}
-
-func (mgr *NestMgr) AnonymousBroadcast(name HandlerName, ids []int64, params Params, cb SingleCallback, opts ...SendOpt) {
-	if mgr == nil || cb == nil || len(ids) == 0 {
-		return
-	}
-	ensureAsyncDispatchAllowed("AnonymousBroadcast", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	mgr.dispatcher.ForEachSpliceBatch(ids, func(eType int, nIds []int64, origIndices []int) {
-		msg := GenMsg(MsgTypeBroadcast)
-		msg.Tids = nIds
-		msg.Name = name.String()
-		msg.Params = []any(params)
-		msg.Cost = optP.Cost
-		msg.Cb1 = func(es []any, params []any) (any, error) {
-			if len(es) != 1 {
-				return nil, errors.New("invalid msg type")
-			}
-			return cb(es[0], Params(params))
-		}
-		bindMsgContext(msg, false)
-		checkRemoteIds(msg, nIds)
-
-		if optP.Delay > 0 {
-			mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-		} else {
-			mgr.dispatcher.SendMsg(msg)
-		}
-	})
-}
-
-func (mgr *NestMgr) Send(name HandlerName, id int64, params Params, opts ...SendOpt) {
-	if mgr == nil {
-		return
-	}
-	ensureAsyncDispatchAllowed("Send", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg := GenMsg(MsgTypeSingle)
-	msg.Tid = id
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, false)
-	checkRemoteId(msg, id)
-
-	if optP.Delay > 0 {
-		mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-	} else {
-		mgr.dispatcher.SendMsg(msg)
-	}
-}
-
-func (mgr *NestMgr) Sync(name HandlerName, id int64, params Params, opts ...SendOpt) (any, error) {
-	if mgr == nil {
-		return nil, ErrNestStopped
-	}
-	if err := ensureSyncDispatchAllowed("Sync", name); err != nil {
-		return nil, err
-	}
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg, ch := GenSyncMsg(MsgTypeSingle)
-	msg.Tid = id
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, true)
-	checkRemoteId(msg, id)
-
-	mgr.dispatcher.SendMsg(msg)
-	return waitSyncResult(ch)
-}
-
-func (mgr *NestMgr) MultiSend(name HandlerName, ids []int64, params Params, opts ...SendOpt) {
-	if mgr == nil || len(ids) == 0 {
-		return
-	}
-	ensureAsyncDispatchAllowed("MultiSend", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg := GenMsg(MsgTypeMulti)
-	msg.Tids = ids
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, false)
-	checkRemoteIds(msg, ids)
-
-	if optP.Delay > 0 {
-		mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-	} else {
-		mgr.dispatcher.SendMsg(msg)
-	}
-}
-
-func (mgr *NestMgr) MultiSync(name HandlerName, ids []int64, params Params, opts ...SendOpt) (any, error) {
-	if mgr == nil {
-		return nil, ErrNestStopped
-	}
-	if err := ensureSyncDispatchAllowed("MultiSync", name); err != nil {
-		return nil, err
-	}
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg, ch := GenSyncMsg(MsgTypeMulti)
-	msg.Tids = ids
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, true)
-	checkRemoteIds(msg, ids)
-
-	mgr.dispatcher.SendMsg(msg)
-	return waitSyncResult(ch)
-}
-
-func (mgr *NestMgr) MultiGroupSend(name HandlerName, groups [][]int64, params Params, opts ...SendOpt) {
-	if mgr == nil || len(groups) == 0 {
-		return
-	}
-	ensureAsyncDispatchAllowed("MultiGroupSend", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg := GenMsg(MsgTypeMultiGroup)
-	msg.GroupTIds = groups
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, false)
-	checkRemoteGroups(msg, groups)
-
-	if optP.Delay > 0 {
-		mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-	} else {
-		mgr.dispatcher.SendMsg(msg)
-	}
-}
-
-func (mgr *NestMgr) MultiGroupSync(name HandlerName, groups [][]int64, params Params, opts ...SendOpt) (any, error) {
-	if mgr == nil {
-		return nil, ErrNestStopped
-	}
-	if err := ensureSyncDispatchAllowed("MultiGroupSync", name); err != nil {
-		return nil, err
-	}
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	msg, ch := GenSyncMsg(MsgTypeMultiGroup)
-	msg.GroupTIds = groups
-	msg.Name = name.String()
-	msg.Params = []any(params)
-	msg.Cost = optP.Cost
-	bindMsgContext(msg, true)
-	checkRemoteGroups(msg, groups)
-
-	mgr.dispatcher.SendMsg(msg)
-	return waitSyncResult(ch)
-}
-
 func ensureAsyncDispatchAllowed(api string, name HandlerName) {
 	if !fctx.InNestHandler() {
 		return
@@ -492,73 +421,4 @@ func ensureAsyncDispatchAllowed(api string, name HandlerName) {
 		"frame", c.Frame,
 	)
 	panic(err)
-}
-
-func ensureSyncDispatchAllowed(api string, name HandlerName) error {
-	if !fctx.InNestHandler() {
-		return nil
-	}
-	c := fctx.CurrentContext()
-	err := fmt.Errorf("%w: api=%s caller=%s target=%s", ErrSyncInHandler, api, c.Meta.Handler, name.String())
-	slog.Error("nest sync dispatch from nest handler rejected",
-		"err", err,
-		"api", api,
-		"caller", c.Meta.Handler,
-		"target", name.String(),
-		"player", c.Meta.PlayerID,
-		"frame", c.Frame,
-	)
-	return err
-}
-
-func waitSyncResult(ch <-chan any) (any, error) {
-	timeout := NestSyncTimeout
-	var done <-chan struct{}
-	if c := fctx.CurrentContext(); c != nil {
-		if c.SyncWait > 0 {
-			timeout = c.SyncWait
-		}
-		done = c.Done()
-	}
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-
-	select {
-	case ret := <-ch:
-		if e, ok := ret.(error); ok {
-			return nil, e
-		}
-		return ret, nil
-	case <-done:
-		return nil, ErrNestCanceled
-	case <-timer.C:
-		return nil, ErrNestTimeout
-	}
-}
-
-func (mgr *NestMgr) Broadcast(name HandlerName, ids []int64, params Params, opts ...SendOpt) {
-	if mgr == nil || len(ids) == 0 {
-		return
-	}
-	ensureAsyncDispatchAllowed("Broadcast", name)
-	optP := &sendOptParam{}
-	for _, opt := range opts {
-		opt(optP)
-	}
-
-	mgr.dispatcher.ForEachSpliceBatch(ids, func(eType int, nIds []int64, origIndices []int) {
-		msg := GenMsg(MsgTypeBroadcast)
-		msg.Tids = nIds
-		msg.Name = name.String()
-		msg.Params = []any(params)
-		msg.Cost = optP.Cost
-		bindMsgContext(msg, false)
-		checkRemoteIds(msg, nIds)
-
-		if optP.Delay > 0 {
-			mgr.dispatcher.DelaySendMsg(optP.Delay, msg)
-		} else {
-			mgr.dispatcher.SendMsg(msg)
-		}
-	})
 }

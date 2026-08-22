@@ -4,6 +4,7 @@ import "sync"
 
 type SessionState struct {
 	mu          sync.Mutex
+	sendMu      sync.Mutex
 	info        SessionInfo
 	ackTick     uint32
 	lastSent    uint32
@@ -14,6 +15,43 @@ type SessionState struct {
 	sent        map[uint32]Snapshot
 	sentOrder   []uint32
 	maxHistory  int
+	generation  uint64
+	committed   uint32
+	controlSeq  uint32
+}
+
+func (s *SessionState) handleControl(message ControlMessage, latestPublished uint32) error {
+	if s == nil {
+		return ErrSessionNotFound
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return ErrSessionNotFound
+	}
+	if message.Sequence <= s.controlSeq {
+		return ErrInvalidControl
+	}
+	s.controlSeq = message.Sequence
+	switch message.Type {
+	case ControlAck:
+		if message.Tick == 0 || message.Tick > latestPublished || message.Tick > s.lastSent {
+			return ErrInvalidAck
+		}
+		if _, ok := s.sent[message.Tick]; !ok {
+			return ErrInvalidAck
+		}
+		if message.Tick > s.ackTick {
+			s.ackTick = message.Tick
+			s.forceFull = false
+		}
+	case ControlResync:
+		s.forceFull = true
+		s.generation++
+	default:
+		return ErrInvalidControl
+	}
+	return nil
 }
 
 func NewSessionState(info SessionInfo) (*SessionState, error) {
@@ -64,6 +102,7 @@ func (s *SessionState) ForceFull() {
 	s.mu.Lock()
 	if !s.closed {
 		s.forceFull = true
+		s.generation++
 	}
 	s.mu.Unlock()
 }
@@ -77,7 +116,10 @@ func (s *SessionState) SetQualityTier(tier uint8) error {
 	if s.closed {
 		return ErrSessionNotFound
 	}
-	s.qualityTier = tier
+	if s.qualityTier != tier {
+		s.qualityTier = tier
+		s.generation++
+	}
 	return nil
 }
 
@@ -90,14 +132,14 @@ func (s *SessionState) QualityTier() uint8 {
 	return s.qualityTier
 }
 
-func (s *SessionState) prepare(targetTick uint32) (SessionInfo, uint8, *Snapshot, *Snapshot, uint32, bool, error) {
+func (s *SessionState) prepare(targetTick uint32) (SessionInfo, uint8, *Snapshot, *Snapshot, uint32, uint64, bool, error) {
 	if s == nil {
-		return SessionInfo{}, 0, nil, nil, 0, false, ErrSessionNotFound
+		return SessionInfo{}, 0, nil, nil, 0, 0, false, ErrSessionNotFound
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
-		return SessionInfo{}, 0, nil, nil, 0, false, ErrSessionNotFound
+		return SessionInfo{}, 0, nil, nil, 0, 0, false, ErrSessionNotFound
 	}
 	s.sequence++
 	if s.sequence == 0 {
@@ -111,22 +153,26 @@ func (s *SessionState) prepare(targetTick uint32) (SessionInfo, uint8, *Snapshot
 	if !s.forceFull && s.ackTick != 0 && s.ackTick < targetTick {
 		if base, ok := s.sent[s.ackTick]; ok {
 			base = base.Clone()
-			return s.info, s.qualityTier, &base, previous, s.sequence, false, nil
+			return s.info, s.qualityTier, &base, previous, s.sequence, s.generation, false, nil
 		}
 		s.forceFull = true
 	}
-	return s.info, s.qualityTier, nil, previous, s.sequence, true, nil
+	return s.info, s.qualityTier, nil, previous, s.sequence, s.generation, true, nil
 }
 
-func (s *SessionState) markSent(snapshot Snapshot, full bool) {
+func (s *SessionState) commitPrepared(snapshot Snapshot, sequence uint32, generation uint64, full bool) error {
 	if s == nil {
-		return
+		return ErrSessionNotFound
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.closed {
-		s.mu.Unlock()
-		return
+		return ErrSessionNotFound
 	}
+	if generation != s.generation || sequence <= s.committed {
+		return ErrPreparedFrameStale
+	}
+	s.committed = sequence
 	if snapshot.Tick > s.lastSent {
 		s.lastSent = snapshot.Tick
 	}
@@ -142,7 +188,7 @@ func (s *SessionState) markSent(snapshot Snapshot, full bool) {
 	if full {
 		s.forceFull = false
 	}
-	s.mu.Unlock()
+	return nil
 }
 
 func (s *SessionState) Close() {

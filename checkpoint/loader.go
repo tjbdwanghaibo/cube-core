@@ -27,21 +27,33 @@ type LoadTemplate struct {
 
 // Loader orchestrates loading from StorageBackend with dependency resolution.
 type Loader struct {
-	backend StorageBackend
-	exister EntityExister // optional: skip entities already in memory
+	backend     StorageBackend
+	exister     EntityExister // optional: skip entities already in memory
+	concurrency int
 }
 
 // NewLoader creates a Loader.
-func NewLoader(backend StorageBackend, exister EntityExister) *Loader {
+func NewLoader(backend StorageBackend, exister EntityExister, concurrency ...int) *Loader {
+	limit := 4
+	if len(concurrency) > 0 && concurrency[0] > 0 {
+		limit = concurrency[0]
+	}
 	return &Loader{
-		backend: backend,
-		exister: exister,
+		backend:     backend,
+		exister:     exister,
+		concurrency: limit,
 	}
 }
 
 // LoadAll loads all templates respecting dependency order.
 // Templates without dependencies are loaded concurrently.
 func (l *Loader) LoadAll(ctx context.Context, templates []LoadTemplate) error {
+	if l == nil || l.backend == nil {
+		return ErrCheckpointBackendRequired
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if len(templates) == 0 {
 		return nil
 	}
@@ -64,32 +76,55 @@ func (l *Loader) LoadAll(ctx context.Context, templates []LoadTemplate) error {
 }
 
 func (l *Loader) loadLevel(ctx context.Context, indices []int, templates []LoadTemplate) error {
+	if len(indices) == 0 {
+		return nil
+	}
 	if len(indices) == 1 {
 		return l.loadOne(ctx, &templates[indices[0]])
 	}
 
+	workerCount := min(l.concurrency, len(indices))
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	workCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	jobs := make(chan int)
+	errCh := make(chan error, 1)
 	var wg sync.WaitGroup
-	errCh := make(chan error, len(indices))
-
-	for _, idx := range indices {
+	for range workerCount {
 		wg.Add(1)
-		go func(t *LoadTemplate) {
+		go func() {
 			defer wg.Done()
-			if err := l.loadOne(ctx, t); err != nil {
-				errCh <- err
+			for idx := range jobs {
+				if err := l.loadOne(workCtx, &templates[idx]); err != nil {
+					select {
+					case errCh <- err:
+						cancel()
+					default:
+					}
+					return
+				}
 			}
-		}(&templates[idx])
+		}()
 	}
 
-	wg.Wait()
-	close(errCh)
-
-	for err := range errCh {
-		if err != nil {
-			return err
+sendLoop:
+	for _, idx := range indices {
+		select {
+		case jobs <- idx:
+		case <-workCtx.Done():
+			break sendLoop
 		}
 	}
-	return nil
+	close(jobs)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		return err
+	default:
+	}
+	return ctx.Err()
 }
 
 func (l *Loader) loadOne(ctx context.Context, t *LoadTemplate) error {
@@ -103,17 +138,12 @@ func (l *Loader) loadOne(ctx context.Context, t *LoadTemplate) error {
 		BatchSize:  t.BatchSize,
 	}
 
-	docs, err := l.backend.BulkLoad(ctx, op)
-	if err != nil {
-		return fmt.Errorf("load %s: %w", t.Collection, err)
-	}
-
 	var loaded, skipped int
-	for _, doc := range docs {
+	consume := func(doc RawDoc) error {
 		// Skip if already in memory
 		if l.exister != nil && l.exister.Exists(doc.ID) {
 			skipped++
-			continue
+			return nil
 		}
 
 		if t.OnLoad != nil {
@@ -123,15 +153,32 @@ func (l *Loader) loadOne(ctx context.Context, t *LoadTemplate) error {
 				if t.Strict {
 					return fmt.Errorf("load %s doc %d: %w", t.Collection, doc.ID, err)
 				}
-				continue
+				return nil
 			}
 		}
 		loaded++
+		return nil
+	}
+
+	if streaming, ok := l.backend.(StreamingStorageBackend); ok {
+		if err := streaming.StreamLoad(ctx, op, consume); err != nil {
+			return fmt.Errorf("load %s: %w", t.Collection, err)
+		}
+	} else {
+		docs, err := l.backend.BulkLoad(ctx, op)
+		if err != nil {
+			return fmt.Errorf("load %s: %w", t.Collection, err)
+		}
+		for _, doc := range docs {
+			if err := consume(doc); err != nil {
+				return err
+			}
+		}
 	}
 
 	slog.Info("checkpoint loaded",
 		"coll", t.Collection,
-		"total", len(docs),
+		"total", loaded+skipped,
 		"loaded", loaded,
 		"skipped", skipped,
 		"cost_ms", time.Since(start).Milliseconds(),

@@ -263,6 +263,11 @@ func (a *App) run(serverType ServiceName) error {
 		Service: string(serverType),
 		Name:    string(svc.Name()),
 	}); err != nil {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if cleanupErr := svc.Shutdown(cleanupCtx); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("service %s cleanup after lifecycle failure: %w", svc.Name(), cleanupErr))
+		}
+		cleanupCancel()
 		stopModsReverse(startedServiceMods, "mod stop (service-specific)")
 		stopModsReverse(startedSharedMods, "mod stop")
 		return err
@@ -273,19 +278,24 @@ func (a *App) run(serverType ServiceName) error {
 	sigChan, stopSignals := a.exitSignals()
 	defer stopSignals()
 
-	// Serve in background, wait for signal
+	// Serve in background, wait for signal.
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	serveErr := make(chan error, 1)
 	go func() {
 		serveErr <- svc.Serve(ctx)
 	}()
 
-	// Wait for signal or serve error
+	runtimeFailure, _ := Lookup[*RuntimeFailure](a.registry, ModRuntimeFailure)
+	// Wait for signal, fail-stop infrastructure, or service exit.
 	var serviceErr error
 	serveDone := false
 	select {
 	case sig := <-sigChan:
 		slog.Info("received signal, shutting down", "signal", sig)
+	case err := <-runtimeFailure.Done():
+		slog.Error("runtime infrastructure failure, shutting down", "err", err)
+		serviceErr = errors.Join(serviceErr, err)
 	case err := <-serveErr:
 		serveDone = true
 		if err != nil && !errors.Is(err, context.Canceled) {
@@ -294,29 +304,6 @@ func (a *App) run(serverType ServiceName) error {
 		}
 	}
 	cancel()
-
-	if !serveDone {
-		waitTimeout := a.cfg.GetDuration("shutdown.serve_wait_timeout")
-		if waitTimeout <= 0 {
-			waitTimeout = 5 * time.Second
-		}
-		timer := time.NewTimer(waitTimeout)
-		select {
-		case err := <-serveErr:
-			if err != nil && !errors.Is(err, context.Canceled) {
-				slog.Error("service exited with error during shutdown", "err", err)
-				serviceErr = err
-			}
-		case <-timer.C:
-			slog.Warn("service did not exit after context cancellation", "service", svc.Name(), "timeout", waitTimeout)
-		}
-		if !timer.Stop() {
-			select {
-			case <-timer.C:
-			default:
-			}
-		}
-	}
 
 	// --- Graceful shutdown ---
 	shutdownTimeout := a.cfg.GetDuration("shutdown.total_timeout")
@@ -333,9 +320,30 @@ func (a *App) run(serverType ServiceName) error {
 		Name:    string(svc.Name()),
 	})
 	var shutdownErr error
-	if err := svc.Shutdown(shutdownCtx); err != nil {
-		slog.Error("service shutdown error", "err", err)
-		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("service %s shutdown: %w", svc.Name(), err))
+	shutdownResult := make(chan error, 1)
+	go func() { shutdownResult <- svc.Shutdown(shutdownCtx) }()
+	shutdownDone := false
+	for !serveDone || !shutdownDone {
+		select {
+		case err := <-serveErr:
+			serveDone = true
+			if err != nil && !errors.Is(err, context.Canceled) {
+				slog.Error("service exited with error during shutdown", "err", err)
+				serviceErr = errors.Join(serviceErr, err)
+			}
+		case err := <-shutdownResult:
+			shutdownDone = true
+			if err != nil {
+				slog.Error("service shutdown error", "err", err)
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("service %s shutdown: %w", svc.Name(), err))
+			}
+		case <-shutdownCtx.Done():
+			shutdownErr = errors.Join(shutdownErr, fmt.Errorf("service %s shutdown incomplete: %w", svc.Name(), shutdownCtx.Err()))
+			// Dependencies must remain alive while Serve or Shutdown can still
+			// access them. Returning without stopping mods is safer than racing
+			// an uncooperative service during process termination.
+			return errors.Join(serviceErr, shutdownErr)
+		}
 	}
 
 	// Stop service-specific mods in reverse order
@@ -349,11 +357,13 @@ func (a *App) run(serverType ServiceName) error {
 	}
 
 	slog.Info("server stopped", "type", serverType)
-	_ = a.emitLifecycle(context.Background(), lifecycle.Event{
+	if err := a.emitLifecycle(shutdownCtx, lifecycle.Event{
 		Phase:   lifecycle.PhaseServiceStopped,
 		Service: string(serverType),
 		Name:    string(svc.Name()),
-	})
+	}); err != nil {
+		shutdownErr = errors.Join(shutdownErr, err)
+	}
 	return errors.Join(serviceErr, shutdownErr)
 }
 

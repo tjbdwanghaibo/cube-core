@@ -370,12 +370,16 @@ func TestReplicatorUsesAckedProjectedBaseline(t *testing.T) {
 	if err := replicator.Publish(first); err != nil {
 		t.Fatal(err)
 	}
-	full, packets, err := replicator.BuildLatest(9)
+	prepared, err := replicator.PrepareLatest(9)
 	if err != nil {
 		t.Fatal(err)
 	}
+	full, packets := prepared.Frame, prepared.Datagrams
 	if full.Kind != FrameFull || len(full.Objects) != 1 || len(packets) == 0 {
 		t.Fatalf("unexpected projected full frame: %+v", full)
+	}
+	if err := prepared.Commit(); err != nil {
+		t.Fatal(err)
 	}
 	if err := replicator.Acknowledge(9, 1); err != nil {
 		t.Fatal(err)
@@ -425,7 +429,11 @@ func TestReplicatorDeltaUsesExactProjectionPreviouslySent(t *testing.T) {
 	if err := replicator.Publish(first); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := replicator.BuildLatest(10); err != nil {
+	prepared, err := replicator.PrepareLatest(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := prepared.Commit(); err != nil {
 		t.Fatal(err)
 	}
 	if err := replicator.Acknowledge(10, 1); err != nil {
@@ -555,6 +563,91 @@ func TestReplicatorCloseWaitsForActiveTransport(t *testing.T) {
 	case <-closeDone:
 	case <-time.After(time.Second):
 		t.Fatal("Close did not finish after transport returned")
+	}
+}
+
+func TestBuildLatestPreviewCannotBeAcknowledged(t *testing.T) {
+	replicator := NewReplicator(ReplicatorConfig{})
+	t.Cleanup(replicator.Close)
+	if err := replicator.RegisterSession(SessionInfo{ID: 31}); err != nil {
+		t.Fatal(err)
+	}
+	if err := replicator.Publish(mustSnapshot(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, packets, err := replicator.BuildLatest(31); err != nil || len(packets) == 0 {
+		t.Fatalf("preview failed: packets=%d err=%v", len(packets), err)
+	}
+	if err := replicator.Acknowledge(31, 1); !errors.Is(err, ErrInvalidAck) {
+		t.Fatalf("unsent preview became acknowledgeable: %v", err)
+	}
+	state, ok := replicator.Session(31)
+	if !ok || state.LastSent != 0 || !state.ForceFull {
+		t.Fatalf("preview polluted session history: %+v", state)
+	}
+}
+
+func TestSendLatestFailureDoesNotCommitSessionHistory(t *testing.T) {
+	sendErr := errors.New("datagram rejected")
+	replicator := NewReplicator(ReplicatorConfig{Transport: TransportFunc{
+		Datagram: func(context.Context, SessionID, []byte) error { return sendErr },
+	}})
+	t.Cleanup(replicator.Close)
+	if err := replicator.RegisterSession(SessionInfo{ID: 32}); err != nil {
+		t.Fatal(err)
+	}
+	if err := replicator.Publish(mustSnapshot(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replicator.SendLatest(context.Background(), 32); !errors.Is(err, sendErr) {
+		t.Fatalf("expected send failure, got %v", err)
+	}
+	if err := replicator.Acknowledge(32, 1); !errors.Is(err, ErrInvalidAck) {
+		t.Fatalf("failed frame became acknowledgeable: %v", err)
+	}
+	state, ok := replicator.Session(32)
+	if !ok || state.LastSent != 0 || !state.ForceFull {
+		t.Fatalf("failed send polluted session history: %+v", state)
+	}
+}
+
+func TestSetTransportWaitsForInflightSend(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	oldTransport := TransportFunc{Datagram: func(context.Context, SessionID, []byte) error {
+		close(started)
+		<-release
+		return nil
+	}}
+	replicator := NewReplicator(ReplicatorConfig{Transport: oldTransport})
+	t.Cleanup(replicator.Close)
+	if err := replicator.RegisterSession(SessionInfo{ID: 33}); err != nil {
+		t.Fatal(err)
+	}
+	if err := replicator.Publish(mustSnapshot(t, 1, nil)); err != nil {
+		t.Fatal(err)
+	}
+	sent := make(chan error, 1)
+	go func() {
+		_, err := replicator.SendLatest(context.Background(), 33)
+		sent <- err
+	}()
+	<-started
+	swapped := make(chan error, 1)
+	go func() {
+		swapped <- replicator.SetTransport(TransportFunc{Datagram: func(context.Context, SessionID, []byte) error { return nil }})
+	}()
+	select {
+	case err := <-swapped:
+		t.Fatalf("transport changed during an in-flight send: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-swapped; err != nil {
+		t.Fatal(err)
 	}
 }
 

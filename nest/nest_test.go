@@ -3,15 +3,15 @@ package nest
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"github.com/tjbdwanghaibo/cube-core/checkpoint"
 	fctx "github.com/tjbdwanghaibo/cube-core/ctx"
 	"github.com/tjbdwanghaibo/cube-core/entity"
 	"github.com/tjbdwanghaibo/cube-core/hotcode"
 	flog "github.com/tjbdwanghaibo/cube-core/log"
 	"github.com/tjbdwanghaibo/cube-core/obs"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"runtime"
@@ -50,12 +50,24 @@ func init() {
 	})
 }
 
+func TestTransactionPolicyParsingRejectsLegacyAndUnknownValues(t *testing.T) {
+	if _, err := ParseRollbackPolicy("dirty"); err == nil {
+		t.Fatal("legacy rollback=dirty must be rejected")
+	}
+	if policy, err := ParseRollbackPolicy("undo"); err != nil || policy != RollbackUndo {
+		t.Fatalf("parse undo = %v, %v", policy, err)
+	}
+	if _, err := ParseDurabilityPolicy("best_effort"); err == nil {
+		t.Fatal("unknown durability must be rejected")
+	}
+}
+
 func TestHandlerHotcodePatch(t *testing.T) {
 	ResetHandlersForTest()
 	defer ResetHandlersForTest()
 
 	name := NewHandlerName("test_hotcode_handler")
-	if err := RegisterHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+	if err := RegisterMemoryHandler(name, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 		return "origin", nil
 	}); err != nil {
 		t.Fatalf("RegisterHandler: %v", err)
@@ -83,7 +95,7 @@ func TestDispatcherObserveStatsRecordsQueueGauge(t *testing.T) {
 	dispatcher.OnInit()
 	defer dispatcher.OnDestroy()
 
-	dispatcher.DelaySendMsg(time.Hour, GenMsg(MsgTypeSingle))
+	dispatcher.delaySendMsg(time.Hour, GenMsg(MsgTypeSingle))
 	dispatcher.observeStats()
 
 	wantPools := map[string]bool{"main": false, "heartbeat": false, "cost": false}
@@ -141,7 +153,7 @@ func TestDispatcherDelaySendMsgDoesNotCreatePerMessageGoroutines(t *testing.T) {
 
 	before := runtime.NumGoroutine()
 	for i := 0; i < 32; i++ {
-		dispatcher.DelaySendMsg(time.Second, GenMsg(MsgTypeSingle))
+		dispatcher.delaySendMsg(time.Second, GenMsg(MsgTypeSingle))
 	}
 	time.Sleep(20 * time.Millisecond)
 	after := runtime.NumGoroutine()
@@ -190,6 +202,12 @@ func TestNestDispatchLogsSlowTraceWithStackAndMsgInfo(t *testing.T) {
 	id := mustBuildCastID(t, 1001, entity.EntityCategory(1), nestLocalKind)
 	getter.Add(newMockEntity(id, entity.EntityCategory(1)))
 	mgr := &NestMgr{getter: getter}
+	ResetHandlersForTest()
+	t.Cleanup(ResetHandlersForTest)
+	MustRegisterMemoryHandler(NewHandlerName("auto_heartbeat"), func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+		time.Sleep(nestSlowDispatchTraceThreshold + 20*time.Millisecond)
+		return nil, nil
+	})
 	msg := &Msg{
 		Name:      "auto_heartbeat",
 		Type:      MsgTypeSingle,
@@ -198,10 +216,6 @@ func TestNestDispatchLogsSlowTraceWithStackAndMsgInfo(t *testing.T) {
 		GroupTIds: [][]int64{{1, 2}, {3}},
 		Params:    []any{"tick", 7},
 		RetChan:   make(chan any, 1),
-		Cb1: func([]any, []any) (any, error) {
-			time.Sleep(nestSlowDispatchTraceThreshold + 20*time.Millisecond)
-			return nil, nil
-		},
 		RefCount:  2,
 		Cost:      true,
 		HasRemote: false,
@@ -219,7 +233,6 @@ func TestNestDispatchLogsSlowTraceWithStackAndMsgInfo(t *testing.T) {
 		"string",
 		"int",
 		"has_ret_chan",
-		"has_callback",
 		"groups",
 		"tids",
 	} {
@@ -246,6 +259,7 @@ func newMockEntity(id int64, typo entity.EntityCategory) *mockEntity {
 type mockGetter struct {
 	mu       sync.RWMutex
 	entities map[int64]entity.IThreadSafeEntity
+	groups   *entity.EntityManager
 }
 
 type rollbackTestDao struct {
@@ -283,6 +297,42 @@ func (d *rollbackTestDao) Unmarshal(raw []byte) error {
 	return nil
 }
 
+func (d *rollbackTestDao) CaptureRollbackState() ([]byte, error) {
+	return append([]byte(nil), d.Marshal()...), nil
+}
+
+func (d *rollbackTestDao) RestoreRollbackState(raw []byte) error {
+	return d.Unmarshal(raw)
+}
+
+func (d *rollbackTestDao) PrepareCommit(tx *RollbackTx) error {
+	if !d.Tracker.Dirty() {
+		return nil
+	}
+	return tx.AddMutation(EntityMutation{
+		EntityID: d.id,
+		Resource: d.CollName(),
+		Mask:     d.Tracker.Snapshot().PersistDirty,
+		Codec:    "json",
+		Data:     d.Marshal(),
+	})
+}
+
+type recordingCommitter struct {
+	record   CommitRecord
+	released TransactionID
+	err      error
+}
+
+func (c *recordingCommitter) Commit(_ context.Context, record CommitRecord) error {
+	c.record = record
+	return c.err
+}
+
+func (c *recordingCommitter) TransactionReleased(id TransactionID) {
+	c.released = id
+}
+
 type rollbackTestEntity struct {
 	*entity.EntityBase
 	dao *rollbackTestDao
@@ -296,7 +346,7 @@ func (e *rollbackTestEntity) RangeDao(f func(entity.DaoInterface)) {
 }
 
 func newMockGetter() *mockGetter {
-	return &mockGetter{entities: make(map[int64]entity.IThreadSafeEntity)}
+	return &mockGetter{entities: make(map[int64]entity.IThreadSafeEntity), groups: entity.NewEntityManager()}
 }
 
 func (g *mockGetter) Add(e entity.IThreadSafeEntity) {
@@ -305,7 +355,7 @@ func (g *mockGetter) Add(e entity.IThreadSafeEntity) {
 	g.entities[e.ID()] = e
 }
 
-func (g *mockGetter) Get(id int64, _ entity.EntityCategory) (entity.IThreadSafeEntity, error) {
+func (g *mockGetter) Get(_ context.Context, id int64, _ entity.EntityCategory) (entity.IThreadSafeEntity, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	e, ok := g.entities[id]
@@ -315,7 +365,7 @@ func (g *mockGetter) Get(id int64, _ entity.EntityCategory) (entity.IThreadSafeE
 	return e, nil
 }
 
-func (g *mockGetter) GetMany(ids []int64, _ []entity.EntityCategory) ([]entity.IThreadSafeEntity, error) {
+func (g *mockGetter) GetMany(_ context.Context, ids []int64, _ []entity.EntityCategory) ([]entity.IThreadSafeEntity, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	ret := make([]entity.IThreadSafeEntity, len(ids))
@@ -323,6 +373,27 @@ func (g *mockGetter) GetMany(ids []int64, _ []entity.EntityCategory) ([]entity.I
 		ret[i] = g.entities[id]
 	}
 	return ret, nil
+}
+
+func (g *mockGetter) GetGroupEntity(groupID, entityID int64) entity.IThreadSafeEntity {
+	if g.groups == nil {
+		return nil
+	}
+	return g.groups.GetGroupEntity(groupID, entityID)
+}
+
+func (g *mockGetter) GetGroupEntities(groupID int64) []entity.IThreadSafeEntity {
+	if g.groups == nil {
+		return nil
+	}
+	return g.groups.GetGroupEntities(groupID)
+}
+
+func (g *mockGetter) UpdateEntityGroup(value entity.IThreadSafeEntity, groupID int64) error {
+	if g.groups == nil {
+		return entity.ErrEntityNotManaged
+	}
+	return g.groups.UpdateEntityGroup(value, groupID)
 }
 
 func TestRegisterAndDispatchHandler(t *testing.T) {
@@ -339,13 +410,13 @@ func TestRegisterAndDispatchHandler(t *testing.T) {
 	defer StopNest()
 
 	called := make(chan bool, 1)
-	MustRegisterHandler(NewHandlerName("test_handler"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(NewHandlerName("test_handler"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
 		called <- true
 		return "ok", nil
 	})
 
 	// Test sync dispatch
-	ret, err := Nest.Sync(NewHandlerName("test_handler"), id, nil)
+	ret, err := Nest.Request(context.Background(), NewHandlerName("test_handler"), id, nil)
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -378,12 +449,12 @@ func TestMultiDispatchRequiresFirstEntity(t *testing.T) {
 
 	name := NewHandlerName("test_multi_requires_first")
 	called := false
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		called = true
 		return len(es), nil
 	})
 
-	ret, err := Nest.MultiSync(name, []int64{missingID, existingID}, nil)
+	ret, err := Nest.RequestMulti(context.Background(), name, []int64{missingID, existingID}, nil)
 	if !errors.Is(err, ErrEntityNotFound) {
 		t.Fatalf("MultiSync err = %v, want %v", err, ErrEntityNotFound)
 	}
@@ -412,7 +483,7 @@ func TestMultiDispatchAllowsMissingNonFirstEntity(t *testing.T) {
 	defer StopNest()
 
 	name := NewHandlerName("test_multi_allows_missing_non_first")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		if len(es) != 2 {
 			return nil, fmt.Errorf("entities len=%d want 2", len(es))
 		}
@@ -425,7 +496,7 @@ func TestMultiDispatchAllowsMissingNonFirstEntity(t *testing.T) {
 		return "ok", nil
 	})
 
-	ret, err := Nest.MultiSync(name, []int64{firstID, missingID}, nil)
+	ret, err := Nest.RequestMulti(context.Background(), name, []int64{firstID, missingID}, nil)
 	if err != nil {
 		t.Fatalf("MultiSync err = %v", err)
 	}
@@ -452,12 +523,12 @@ func TestMultiGroupDispatchRequiresFirstEntity(t *testing.T) {
 
 	name := NewHandlerName("test_multi_group_requires_first")
 	called := false
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		called = true
 		return len(es), nil
 	})
 
-	ret, err := Nest.MultiGroupSync(name, [][]int64{{missingID}, {existingID}}, nil)
+	ret, err := Nest.RequestMultiGroup(context.Background(), name, [][]int64{{missingID}, {existingID}}, nil)
 	if !errors.Is(err, ErrEntityNotFound) {
 		t.Fatalf("MultiGroupSync err = %v, want %v", err, ErrEntityNotFound)
 	}
@@ -495,11 +566,12 @@ func (r *testRemoteSnapshotResolver) ResolveRemoteSnapshot(access RemoteAccess) 
 		version = access.MinVersion
 	}
 	return entity.RemoteSnapshot{
-		EntityID: access.Ref.EntityID,
-		Kind:     access.Ref.Kind,
-		Scope:    access.Scope,
-		Version:  version,
-		Data:     "cached-view",
+		EntityID:   access.Ref.EntityID,
+		Kind:       access.Ref.Kind,
+		Scope:      access.Scope,
+		Version:    version,
+		RouteEpoch: access.Ref.RouteEpoch,
+		Data:       "cached-view",
 	}, nil
 }
 
@@ -526,7 +598,7 @@ func TestNestRemoteAccessPreloadsSnapshotBeforeHandler(t *testing.T) {
 
 	name := NewHandlerName("test_remote_access_preload")
 	key := RemoteKey[string]{Alias: "target_player"}
-	MustRegisterHandler(name, func(_ []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(_ []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		snapshot, ok := Remote(key)
 		if !ok {
 			return nil, errors.New("missing target_player snapshot")
@@ -534,7 +606,7 @@ func TestNestRemoteAccessPreloadsSnapshotBeforeHandler(t *testing.T) {
 		return snapshot, nil
 	})
 
-	ret, err := Nest.Sync(name, id, NewParams(testRemoteAccessRequest{Ref: ref}))
+	ret, err := Nest.Request(context.Background(), name, id, NewParams(testRemoteAccessRequest{Ref: ref}))
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -590,11 +662,11 @@ func TestNestRemoteKeyAndRemoteAccessTTL(t *testing.T) {
 
 	key := RemoteKey[string]{Alias: "target_player"}
 	name := NewHandlerName("test_remote_key_ttl")
-	MustRegisterHandler(name, func(_ []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(_ []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
 		return MustRemote(key), nil
 	})
 
-	ret, err := Nest.Sync(name, id, NewParams(testRemoteAccessWithTTLRequest{Ref: ref}))
+	ret, err := Nest.Request(context.Background(), name, id, NewParams(testRemoteAccessWithTTLRequest{Ref: ref}))
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -617,19 +689,19 @@ func TestNestHandlerRejectsNestedSyncDispatch(t *testing.T) {
 		{
 			name: "sync",
 			run: func(target HandlerName, id1 int64, _ int64) (any, error) {
-				return Nest.Sync(target, id1, nil)
+				return Nest.Request(context.Background(), target, id1, nil)
 			},
 		},
 		{
 			name: "multi_sync",
 			run: func(target HandlerName, id1 int64, id2 int64) (any, error) {
-				return Nest.MultiSync(target, []int64{id1, id2}, nil)
+				return Nest.RequestMulti(context.Background(), target, []int64{id1, id2}, nil)
 			},
 		},
 		{
 			name: "multi_group_sync",
 			run: func(target HandlerName, id1 int64, id2 int64) (any, error) {
-				return Nest.MultiGroupSync(target, [][]int64{{id1}, {id2}}, nil)
+				return Nest.RequestMultiGroup(context.Background(), target, [][]int64{{id1}, {id2}}, nil)
 			},
 		},
 	}
@@ -655,15 +727,15 @@ func TestNestHandlerRejectsNestedSyncDispatch(t *testing.T) {
 			called := make(chan string, 1)
 			targetName := NewHandlerName("test_nested_sync_target_" + tc.name)
 			outerName := NewHandlerName("test_nested_sync_outer_" + tc.name)
-			MustRegisterHandler(targetName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+			MustRegisterMemoryHandler(targetName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 				called <- "handler"
 				return "inner-ok", nil
 			})
-			MustRegisterHandler(outerName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+			MustRegisterMemoryHandler(outerName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 				return tc.run(targetName, id1, id2)
 			})
 
-			ret, err := Nest.Sync(outerName, id1, nil)
+			ret, err := Nest.Request(context.Background(), outerName, id1, nil)
 			if !errors.Is(err, ErrSyncInHandler) {
 				t.Fatalf("outer sync err = %v, want %v", err, ErrSyncInHandler)
 			}
@@ -682,57 +754,30 @@ func TestNestHandlerRejectsNestedSyncDispatch(t *testing.T) {
 func TestNestHandlerRejectsNestedAsyncDispatch(t *testing.T) {
 	cases := []struct {
 		name string
-		run  func(target HandlerName, id int64, called chan<- string)
+		run  func(target HandlerName, id int64) error
 	}{
 		{
 			name: "send",
-			run: func(target HandlerName, id int64, _ chan<- string) {
-				Nest.Send(target, id, nil)
+			run: func(target HandlerName, id int64) error {
+				return Nest.Dispatch(context.Background(), target, id, nil)
 			},
 		},
 		{
 			name: "multi_send",
-			run: func(target HandlerName, id int64, _ chan<- string) {
-				Nest.MultiSend(target, []int64{id}, nil)
+			run: func(target HandlerName, id int64) error {
+				return Nest.DispatchMulti(context.Background(), target, []int64{id}, nil)
 			},
 		},
 		{
 			name: "multi_group_send",
-			run: func(target HandlerName, id int64, _ chan<- string) {
-				Nest.MultiGroupSend(target, [][]int64{{id}}, nil)
+			run: func(target HandlerName, id int64) error {
+				return Nest.DispatchMultiGroup(context.Background(), target, [][]int64{{id}}, nil)
 			},
 		},
 		{
 			name: "broadcast",
-			run: func(target HandlerName, id int64, _ chan<- string) {
-				Nest.Broadcast(target, []int64{id}, nil)
-			},
-		},
-		{
-			name: "anonymous_send",
-			run: func(target HandlerName, id int64, called chan<- string) {
-				Nest.AnonymousSend(target, id, nil, func(any, Params) (any, error) {
-					called <- "anonymous_send"
-					return nil, nil
-				})
-			},
-		},
-		{
-			name: "anonymous_multi_send",
-			run: func(target HandlerName, id int64, called chan<- string) {
-				Nest.AnonymousMultiSend(target, []int64{id}, nil, func([]any, Params) (any, error) {
-					called <- "anonymous_multi_send"
-					return nil, nil
-				})
-			},
-		},
-		{
-			name: "anonymous_broadcast",
-			run: func(target HandlerName, id int64, called chan<- string) {
-				Nest.AnonymousBroadcast(target, []int64{id}, nil, func(any, Params) (any, error) {
-					called <- "anonymous_broadcast"
-					return nil, nil
-				})
+			run: func(target HandlerName, id int64) error {
+				return Nest.DispatchBroadcast(context.Background(), target, []int64{id}, nil)
 			},
 		},
 	}
@@ -756,16 +801,18 @@ func TestNestHandlerRejectsNestedAsyncDispatch(t *testing.T) {
 			called := make(chan string, 1)
 			targetName := NewHandlerName("test_nested_async_target_" + tc.name)
 			outerName := NewHandlerName("test_nested_async_outer_" + tc.name)
-			MustRegisterHandler(targetName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+			MustRegisterMemoryHandler(targetName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
 				called <- "handler"
 				return nil, nil
 			})
-			MustRegisterHandler(outerName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
-				tc.run(targetName, id, called)
+			MustRegisterMemoryHandler(outerName, func([]entity.IThreadSafeEntity, []any, ...HandlerOption) (any, error) {
+				if err := tc.run(targetName, id); err != nil {
+					return nil, err
+				}
 				return "outer-ok", nil
 			})
 
-			ret, err := Nest.Sync(outerName, id, nil)
+			ret, err := Nest.Request(context.Background(), outerName, id, nil)
 			if !errors.Is(err, ErrAsyncInHandler) {
 				t.Fatalf("outer sync err = %v, want %v", err, ErrAsyncInHandler)
 			}
@@ -808,7 +855,7 @@ func TestRollbackStateRestoresDaoAndDirty(t *testing.T) {
 		return nil, errors.New("boom")
 	}, HandlerMeta{Rollback: RollbackState})
 
-	_, err := Nest.Sync(NewHandlerName("test_rollback_state"), id, nil)
+	_, err := Nest.Request(context.Background(), NewHandlerName("test_rollback_state"), id, nil)
 	if err == nil {
 		t.Fatal("expected handler error")
 	}
@@ -820,42 +867,6 @@ func TestRollbackStateRestoresDaoAndDirty(t *testing.T) {
 	}
 	if committed {
 		t.Fatal("after commit callback should not run on rollback")
-	}
-}
-
-func TestRollbackDirtyOnlyKeepsStateAndRestoresDirty(t *testing.T) {
-	getter := newMockGetter()
-	id := mustBuildCastID(t, 302, entity.EntityCategory(1), nestLocalKind)
-	dao := &rollbackTestDao{id: id, Value: 10}
-	e := &rollbackTestEntity{
-		EntityBase: entity.NewEntityBase(id, entity.EntityCategory(1), false, nestLocalKind),
-		dao:        dao,
-	}
-	getter.Add(e)
-
-	InitNest(
-		NestOptionWithGetter(getter),
-		NestOptionWithWorkerNumAndMsgCap(1, 1, 64),
-		NestOptionWithTickDuration(100*time.Millisecond),
-	)
-	defer StopNest()
-
-	MustRegisterHandlerWithMeta(NewHandlerName("test_rollback_dirty"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
-		ent := es[0].(*rollbackTestEntity)
-		ent.dao.Value = 99
-		ent.dao.Tracker.MarkPersist(1)
-		return nil, errors.New("boom")
-	}, HandlerMeta{Rollback: RollbackDirty})
-
-	_, err := Nest.Sync(NewHandlerName("test_rollback_dirty"), id, nil)
-	if err == nil {
-		t.Fatal("expected handler error")
-	}
-	if dao.Value != 99 {
-		t.Fatalf("dao value = %d, dirty rollback should not restore state", dao.Value)
-	}
-	if dao.Tracker.Dirty() {
-		t.Fatal("dirty mask should be restored to clean")
 	}
 }
 
@@ -886,7 +897,7 @@ func TestRollbackAfterCommitRunsOnSuccess(t *testing.T) {
 		return "ok", nil
 	}, HandlerMeta{Rollback: RollbackState})
 
-	ret, err := Nest.Sync(NewHandlerName("test_rollback_commit"), id, nil)
+	ret, err := Nest.Request(context.Background(), NewHandlerName("test_rollback_commit"), id, nil)
 	if err != nil {
 		t.Fatalf("sync: %v", err)
 	}
@@ -897,6 +908,206 @@ func TestRollbackAfterCommitRunsOnSuccess(t *testing.T) {
 	case <-committed:
 	case <-time.After(time.Second):
 		t.Fatal("after commit callback was not called")
+	}
+}
+
+func TestRollbackUndoRestoresStateAndDirty(t *testing.T) {
+	getter := newMockGetter()
+	id := mustBuildCastID(t, 304, entity.EntityCategory(1), nestLocalKind)
+	dao := &rollbackTestDao{id: id, Value: 10}
+	getter.Add(&rollbackTestEntity{
+		EntityBase: entity.NewEntityBase(id, entity.EntityCategory(1), false, nestLocalKind),
+		dao:        dao,
+	})
+
+	InitNest(
+		NestOptionWithGetter(getter),
+		NestOptionWithWorkerNumAndMsgCap(1, 1, 64),
+		NestOptionWithTickDuration(100*time.Millisecond),
+	)
+	defer StopNest()
+
+	MustRegisterHandlerWithMeta(NewHandlerName("test_rollback_undo"), func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+		ent := es[0].(*rollbackTestEntity)
+		old := ent.dao.Value
+		if !RecordUndo(ent.dao, 1, func() error {
+			ent.dao.Value = old
+			return nil
+		}) {
+			return nil, errors.New("missing undo transaction")
+		}
+		ent.dao.Value = 99
+		ent.dao.Tracker.MarkPersist(1)
+		return nil, errors.New("boom")
+	}, HandlerMeta{Rollback: RollbackUndo})
+
+	_, err := Nest.Request(context.Background(), NewHandlerName("test_rollback_undo"), id, nil)
+	if err == nil {
+		t.Fatal("expected handler error")
+	}
+	if dao.Value != 10 || dao.Tracker.Dirty() {
+		t.Fatalf("value=%d dirty=%v, want value=10 dirty=false", dao.Value, dao.Tracker.Dirty())
+	}
+}
+
+func TestStrictCommitFailureRollsBack(t *testing.T) {
+	getter := newMockGetter()
+	id := mustBuildCastID(t, 305, entity.EntityCategory(1), nestLocalKind)
+	dao := &rollbackTestDao{id: id, Value: 10}
+	getter.Add(&rollbackTestEntity{
+		EntityBase: entity.NewEntityBase(id, entity.EntityCategory(1), false, nestLocalKind),
+		dao:        dao,
+	})
+	committer := &recordingCommitter{err: errors.New("wal fsync failed")}
+
+	InitNest(
+		NestOptionWithGetter(getter),
+		NestOptionWithTransactionCommitter(committer),
+		NestOptionWithWorkerNumAndMsgCap(1, 1, 64),
+		NestOptionWithTickDuration(100*time.Millisecond),
+	)
+	defer StopNest()
+
+	MustRegisterHandlerWithMeta(NewHandlerName("test_strict_commit_failure"), func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+		ent := es[0].(*rollbackTestEntity)
+		old := ent.dao.Value
+		if !RecordUndo(ent.dao, 1, func() error { ent.dao.Value = old; return nil }) {
+			return nil, errors.New("missing undo transaction")
+		}
+		ent.dao.Value = 20
+		ent.dao.Tracker.MarkPersist(1)
+		return "not-committed", nil
+	}, HandlerMeta{Rollback: RollbackUndo, Durability: DurabilityStrict})
+
+	ret, err := Nest.Request(context.Background(), NewHandlerName("test_strict_commit_failure"), id, nil)
+	if !errors.Is(err, ErrCommitRejected) {
+		t.Fatalf("err=%v, want %v", err, ErrCommitRejected)
+	}
+	if ret != nil {
+		t.Fatalf("ret=%v, want nil", ret)
+	}
+	if dao.Value != 10 || dao.Tracker.Dirty() {
+		t.Fatalf("value=%d dirty=%v, want rollback", dao.Value, dao.Tracker.Dirty())
+	}
+	if len(committer.record.Mutations) != 1 || committer.record.Mutations[0].EntityID != id {
+		t.Fatalf("commit record=%+v", committer.record)
+	}
+}
+
+func TestStrictCommitSuccessKeepsState(t *testing.T) {
+	getter := newMockGetter()
+	id := mustBuildCastID(t, 306, entity.EntityCategory(1), nestLocalKind)
+	dao := &rollbackTestDao{id: id, Value: 10}
+	getter.Add(&rollbackTestEntity{
+		EntityBase: entity.NewEntityBase(id, entity.EntityCategory(1), false, nestLocalKind),
+		dao:        dao,
+	})
+	committer := &recordingCommitter{}
+
+	InitNest(
+		NestOptionWithGetter(getter),
+		NestOptionWithTransactionCommitter(committer),
+		NestOptionWithWorkerNumAndMsgCap(1, 1, 64),
+		NestOptionWithTickDuration(100*time.Millisecond),
+	)
+	defer StopNest()
+
+	MustRegisterHandlerWithMeta(NewHandlerName("test_strict_commit_success"), func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+		ent := es[0].(*rollbackTestEntity)
+		old := ent.dao.Value
+		if !RecordUndo(ent.dao, 1, func() error { ent.dao.Value = old; return nil }) {
+			return nil, errors.New("missing undo transaction")
+		}
+		ent.dao.Value = 20
+		ent.dao.Tracker.MarkPersist(1)
+		return "committed", nil
+	}, HandlerMeta{Rollback: RollbackUndo, Durability: DurabilityStrict})
+
+	ret, err := Nest.Request(context.Background(), NewHandlerName("test_strict_commit_success"), id, nil)
+	if err != nil || ret != "committed" {
+		t.Fatalf("ret=%v err=%v", ret, err)
+	}
+	if dao.Value != 20 || len(committer.record.Mutations) != 1 {
+		t.Fatalf("value=%d record=%+v", dao.Value, committer.record)
+	}
+	if committer.released != committer.record.ID {
+		t.Fatalf("released=%s record=%s", committer.released.String(), committer.record.ID.String())
+	}
+}
+
+func TestIndeterminateCommitDoesNotRollback(t *testing.T) {
+	getter := newMockGetter()
+	id := mustBuildCastID(t, 307, entity.EntityCategory(1), nestLocalKind)
+	dao := &rollbackTestDao{id: id, Value: 10}
+	getter.Add(&rollbackTestEntity{
+		EntityBase: entity.NewEntityBase(id, entity.EntityCategory(1), false, nestLocalKind),
+		dao:        dao,
+	})
+	committer := &recordingCommitter{err: errors.Join(ErrCommitIndeterminate, errors.New("fsync outcome unknown"))}
+
+	InitNest(
+		NestOptionWithGetter(getter),
+		NestOptionWithTransactionCommitter(committer),
+		NestOptionWithWorkerNumAndMsgCap(1, 1, 64),
+		NestOptionWithTickDuration(100*time.Millisecond),
+	)
+	defer StopNest()
+
+	MustRegisterHandlerWithMeta(NewHandlerName("test_indeterminate_commit"), func(es []entity.IThreadSafeEntity, _ []any, _ ...HandlerOption) (any, error) {
+		ent := es[0].(*rollbackTestEntity)
+		old := ent.dao.Value
+		if !RecordUndo(ent.dao, 1, func() error { ent.dao.Value = old; return nil }) {
+			return nil, errors.New("missing undo transaction")
+		}
+		ent.dao.Value = 20
+		ent.dao.Tracker.MarkPersist(1)
+		return "unknown", nil
+	}, HandlerMeta{Rollback: RollbackUndo, Durability: DurabilityStrict})
+
+	ret, err := Nest.Request(context.Background(), NewHandlerName("test_indeterminate_commit"), id, nil)
+	if !errors.Is(err, ErrCommitIndeterminate) || ret != nil {
+		t.Fatalf("ret=%v err=%v", ret, err)
+	}
+	if dao.Value != 20 || !dao.Tracker.Dirty() {
+		t.Fatalf("value=%d dirty=%v, indeterminate state must not roll back", dao.Value, dao.Tracker.Dirty())
+	}
+	if !committer.released.IsZero() {
+		t.Fatalf("indeterminate transaction was released to delivery: %s", committer.released.String())
+	}
+}
+
+func TestRecordUndoTokenSeparatesMapKeys(t *testing.T) {
+	tx := NewRollbackTx(RollbackUndo)
+	values := map[string]int{"a": 1, "b": 2}
+	if err := tx.RecordUndoToken(&values, 1, "a", func() error { values["a"] = 1; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.RecordUndoToken(&values, 1, "b", func() error { values["b"] = 2; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	// A repeated write to the same field/key must keep the first before-image.
+	if err := tx.RecordUndoToken(&values, 1, "a", func() error { values["a"] = 99; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	values["a"], values["b"] = 10, 20
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if values["a"] != 1 || values["b"] != 2 {
+		t.Fatalf("values=%v", values)
+	}
+}
+
+func TestEmitUpgradesTransactionToStrictDurability(t *testing.T) {
+	tx := NewRollbackTx(RollbackUndo)
+	if err := tx.Emit(Effect{Topic: "player.changed", Payload: []byte("event")}); err != nil {
+		t.Fatal(err)
+	}
+	if tx.durability != DurabilityStrict {
+		t.Fatalf("durability=%s, want strict", tx.durability.String())
+	}
+	if len(tx.effects) != 1 || tx.effects[0].ID == "" {
+		t.Fatalf("effects=%+v", tx.effects)
 	}
 }
 
@@ -913,7 +1124,7 @@ func TestSyncUsesRequestSyncWait(t *testing.T) {
 	)
 	defer StopNest()
 
-	MustRegisterHandler(NewHandlerName("test_request_sync_wait"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(NewHandlerName("test_request_sync_wait"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
 		time.Sleep(50 * time.Millisecond)
 		return "late", nil
 	})
@@ -921,7 +1132,7 @@ func TestSyncUsesRequestSyncWait(t *testing.T) {
 	_, release := fctx.NewContext(fctx.WithSyncWait(5 * time.Millisecond))
 	defer release()
 
-	_, err := Nest.Sync(NewHandlerName("test_request_sync_wait"), id, nil)
+	_, err := Nest.Request(context.Background(), NewHandlerName("test_request_sync_wait"), id, nil)
 	if !errors.Is(err, ErrNestTimeout) {
 		t.Fatalf("Sync err = %v, want %v", err, ErrNestTimeout)
 	}
@@ -942,7 +1153,7 @@ func TestSyncCarriesCurrentContextIntoHandler(t *testing.T) {
 
 	base, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	MustRegisterHandler(NewHandlerName("test_request_context_in_handler"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(NewHandlerName("test_request_context_in_handler"), func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
 		c := fctx.CurrentContext()
 		if c == nil {
 			return nil, errors.New("handler has no request context")
@@ -966,7 +1177,7 @@ func TestSyncCarriesCurrentContextIntoHandler(t *testing.T) {
 	)
 	defer release()
 
-	ret, err := Nest.Sync(NewHandlerName("test_request_context_in_handler"), id, nil)
+	ret, err := Nest.Request(base, NewHandlerName("test_request_context_in_handler"), id, nil)
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -991,7 +1202,7 @@ func TestNestTracePropagatesContextAndRecordsEvents(t *testing.T) {
 	defer StopNest()
 
 	name := NewHandlerName("test_nest_trace_context")
-	MustRegisterHandler(name, func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
+	MustRegisterMemoryHandler(name, func(es []entity.IThreadSafeEntity, param []any, opts ...HandlerOption) (any, error) {
 		c := fctx.CurrentContext()
 		if c == nil {
 			return nil, errors.New("handler has no request context")
@@ -1021,7 +1232,7 @@ func TestNestTracePropagatesContextAndRecordsEvents(t *testing.T) {
 	)
 	defer release()
 
-	ret, err := Nest.Sync(name, id, nil)
+	ret, err := Nest.Request(context.Background(), name, id, nil)
 	if err != nil {
 		t.Fatalf("Sync failed: %v", err)
 	}
@@ -1096,7 +1307,7 @@ func TestWorkerPool(t *testing.T) {
 	msg := GenMsg(MsgTypeSingle)
 	msg.Tid = 42
 	msg.Name = "hello"
-	d.SendMsg(msg)
+	d.sendMsg(msg)
 
 	select {
 	case name := <-results:
@@ -1115,7 +1326,7 @@ func TestDispatcherStoppedReturnsErrorForSyncMessage(t *testing.T) {
 	d.OnDestroy()
 
 	msg, ch := GenSyncMsg(MsgTypeSingle)
-	d.SendMsg(msg)
+	d.sendMsg(msg)
 
 	select {
 	case ret := <-ch:
@@ -1164,41 +1375,5 @@ func TestEntityKindRemoteCapability(t *testing.T) {
 	}
 	if entity.IsEntityKindRemoteCapable(nestUnknownKind) {
 		t.Fatal("unregistered kind should not be remote-capable")
-	}
-}
-
-func TestAnonymousBroadcastCallsEachEntity(t *testing.T) {
-	getter := newMockGetter()
-	id1 := mustBuildCastID(t, 101, entity.EntityCategory(1), nestLocalKind)
-	id2 := mustBuildCastID(t, 102, entity.EntityCategory(1), nestLocalKind)
-	e1 := newMockEntity(id1, entity.EntityCategory(1))
-	e2 := newMockEntity(id2, entity.EntityCategory(1))
-	getter.Add(e1)
-	getter.Add(e2)
-
-	InitNest(
-		NestOptionWithGetter(getter),
-		NestOptionWithWorkerNumAndMsgCap(2, 1, 64),
-		NestOptionWithTickDuration(100*time.Millisecond),
-	)
-	defer StopNest()
-
-	called := make(chan int64, 2)
-	Nest.AnonymousBroadcast(NewHandlerName("test_abroadcast"), []int64{id1, id2}, nil, func(e any, _ Params) (any, error) {
-		called <- e.(entity.IThreadSafeEntity).ID()
-		return nil, nil
-	})
-
-	got := map[int64]bool{}
-	for len(got) < 2 {
-		select {
-		case id := <-called:
-			got[id] = true
-		case <-time.After(time.Second):
-			t.Fatalf("timeout waiting for AnonymousBroadcast, got=%v", got)
-		}
-	}
-	if !got[id1] || !got[id2] {
-		t.Fatalf("got = %v, want both ids", got)
 	}
 }

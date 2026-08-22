@@ -122,9 +122,9 @@ func TestAppUsesConfiguredShutdownTimeout(t *testing.T) {
 }
 
 type slowSignalService struct {
-	started                 chan struct{}
-	serveExited             chan struct{}
-	shutdownBeforeServeExit atomic.Bool
+	started        chan struct{}
+	serveExited    chan struct{}
+	shutdownCalled atomic.Bool
 }
 
 func newSlowSignalService() *slowSignalService {
@@ -146,17 +146,31 @@ func (s *slowSignalService) Serve(ctx context.Context) error {
 	return nil
 }
 func (s *slowSignalService) Shutdown(context.Context) error {
-	select {
-	case <-s.serveExited:
-	default:
-		s.shutdownBeforeServeExit.Store(true)
-	}
+	s.shutdownCalled.Store(true)
 	return nil
 }
 
-func TestAppWaitsForServeExitBeforeShutdownAfterSignal(t *testing.T) {
+type serveOrderingMod struct {
+	serveExited     <-chan struct{}
+	stoppedTooEarly atomic.Bool
+}
+
+func (m *serveOrderingMod) Name() ModName           { return "serve_ordering" }
+func (m *serveOrderingMod) Init(*viper.Viper) error { return nil }
+func (m *serveOrderingMod) Provide(*Registry) error { return nil }
+func (m *serveOrderingMod) Start() error            { return nil }
+func (m *serveOrderingMod) Stop() {
+	select {
+	case <-m.serveExited:
+	default:
+		m.stoppedTooEarly.Store(true)
+	}
+}
+
+func TestAppShutsServiceBeforeStoppingDependencies(t *testing.T) {
 	svc := newSlowSignalService()
-	a := newTestApp(t, svc)
+	mod := &serveOrderingMod{serveExited: svc.serveExited}
+	a := newTestApp(t, svc, mod)
 	a.RootCmd().SetArgs([]string{"game"})
 	signals := make(chan os.Signal, 1)
 	a.signalSource = func() (<-chan os.Signal, func()) {
@@ -171,8 +185,47 @@ func TestAppWaitsForServeExitBeforeShutdownAfterSignal(t *testing.T) {
 	if err := a.Execute(); err != nil {
 		t.Fatalf("Execute: %v", err)
 	}
-	if svc.shutdownBeforeServeExit.Load() {
-		t.Fatalf("Shutdown ran before Serve exited")
+	if !svc.shutdownCalled.Load() {
+		t.Fatal("Shutdown was not called")
+	}
+	if mod.stoppedTooEarly.Load() {
+		t.Fatal("dependency mod stopped while Serve was still running")
+	}
+}
+
+type uncooperativeService struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *uncooperativeService) Name() ServiceName    { return "game" }
+func (s *uncooperativeService) Init(*Registry) error { return nil }
+func (s *uncooperativeService) Serve(context.Context) error {
+	close(s.started)
+	<-s.release
+	return nil
+}
+func (s *uncooperativeService) Shutdown(context.Context) error { return nil }
+
+func TestAppKeepsDependenciesAliveWhenServeMissesShutdownDeadline(t *testing.T) {
+	svc := &uncooperativeService{started: make(chan struct{}), release: make(chan struct{})}
+	mod := &contextStopMod{}
+	a := newTestApp(t, svc, mod)
+	a.cfg.Set("shutdown.total_timeout", 20*time.Millisecond)
+	a.RootCmd().SetArgs([]string{"game"})
+	signals := make(chan os.Signal, 1)
+	a.signalSource = func() (<-chan os.Signal, func()) { return signals, func() {} }
+	go func() {
+		<-svc.started
+		signals <- os.Interrupt
+	}()
+	err := a.Execute()
+	close(svc.release)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Execute error = %v, want shutdown deadline", err)
+	}
+	if mod.stopCalled.Load() || mod.stopContextCalled.Load() {
+		t.Fatal("dependencies stopped while Serve was still running")
 	}
 }
 

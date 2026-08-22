@@ -4,10 +4,32 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+
+	"go.mongodb.org/mongo-driver/v2/bson"
 )
 
 func TestSmallSafeMapContract(t *testing.T) {
 	exerciseMap(t, NewSmallSafeMap[int64, string](2))
+}
+
+func TestSmallSafeMapBSONV2RoundTrip(t *testing.T) {
+	source := NewSmallSafeMap[string, int](2)
+	source.Set("alpha", 1)
+	source.Set("beta", 2)
+	typeCode, data, err := source.MarshalBSONValue()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if typeCode != bson.TypeEmbeddedDocument {
+		t.Fatalf("BSON type = %v, want embedded document", typeCode)
+	}
+	restored := NewSmallSafeMap[string, int](0)
+	if err := restored.UnmarshalBSONValue(typeCode, data); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := restored.Get("alpha"); !ok || got != 1 {
+		t.Fatalf("round-trip alpha = %d, %v", got, ok)
+	}
 }
 
 func TestShardedSafeMapContract(t *testing.T) {

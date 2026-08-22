@@ -80,7 +80,7 @@ func (mgr *NestMgr) requestEntityLockGroupTransition(entityID int64, state entit
 		return err
 	}
 	meta := entity.ResolveEntityID(fullID)
-	ent, err := mgr.getter.Get(meta.FullID, meta.Category)
+	ent, err := mgr.getter.Get(nestBaseContext(), meta.FullID, meta.Category)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ func (mgr *NestMgr) requestEntityLockGroupTransition(entityID int64, state entit
 	}
 	bindMsgContext(msg, false)
 	observeEntityGroupTransition(msg.GroupTransition, "request")
-	mgr.dispatcher.SendMsg(msg)
+	mgr.dispatcher.sendMsg(msg)
 	return nil
 }
 
@@ -133,7 +133,7 @@ func (mgr *NestMgr) groupTransitionDispatch(req *GroupTransitionRequest) (ret an
 		return nil, err
 	}
 	meta := entity.ResolveEntityID(fullID)
-	ent, err := mgr.getter.Get(meta.FullID, meta.Category)
+	ent, err := mgr.getter.Get(nestBaseContext(), meta.FullID, meta.Category)
 	if err != nil {
 		return nil, err
 	}
@@ -143,7 +143,7 @@ func (mgr *NestMgr) groupTransitionDispatch(req *GroupTransitionRequest) (ret an
 	defer ent.UnTouch()
 
 	groupIDs := transitionLockGroupIDs(ent.Base().GroupLockID(), req.TargetGroupID, req.State)
-	unlockGroups, ok := tryLockEntityLockGroups(groupIDs)
+	unlockGroups, ok := mgr.tryLockEntityLockGroups(groupIDs)
 	if !ok {
 		return nil, mgr.retryGroupTransition(req, "group_lock_busy")
 	}
@@ -160,24 +160,25 @@ func (mgr *NestMgr) groupTransitionDispatch(req *GroupTransitionRequest) (ret an
 		ent.Base().GroupTransitionTargetID() != req.TargetGroupID {
 		return nil, fmt.Errorf("%w: stale transition", ErrEntityGroupTransitionPending)
 	}
-	if entity.Mgr == nil {
+	groups := groupStoreOf(mgr.getter)
+	if groups == nil {
 		ent.Base().ClearGroupTransition()
 		return nil, ErrEntityNotFound
 	}
 
 	switch req.State {
 	case entity.EntityGroupTransitionJoin:
-		if err := entity.Mgr.UpdateEntityGroup(ent, req.TargetGroupID); err != nil {
+		if err := groups.UpdateEntityGroup(ent, req.TargetGroupID); err != nil {
 			ent.Base().ClearGroupTransition()
 			return nil, err
 		}
 	case entity.EntityGroupTransitionLeave:
-		if err := entity.Mgr.UpdateEntityGroup(ent, 0); err != nil {
+		if err := groups.UpdateEntityGroup(ent, 0); err != nil {
 			ent.Base().ClearGroupTransition()
 			return nil, err
 		}
 	case entity.EntityGroupTransitionMove:
-		if err := entity.Mgr.UpdateEntityGroup(ent, req.TargetGroupID); err != nil {
+		if err := groups.UpdateEntityGroup(ent, req.TargetGroupID); err != nil {
 			ent.Base().ClearGroupTransition()
 			return nil, err
 		}
@@ -216,7 +217,7 @@ func (mgr *NestMgr) retryGroupTransition(req *GroupTransitionRequest, reason str
 	if cur := currentNestDispatchMsg(); cur != nil {
 		msg.Context = cur.Context.Clone()
 	}
-	mgr.dispatcher.DelaySendMsg(entityGroupTransitionRetryDelay, msg)
+	mgr.dispatcher.delaySendMsg(entityGroupTransitionRetryDelay, msg)
 	return ErrEntityGroupTransitionScheduled
 }
 
@@ -229,7 +230,7 @@ func (mgr *NestMgr) abortGroupTransition(req *GroupTransitionRequest) {
 		return
 	}
 	meta := entity.ResolveEntityID(fullID)
-	ent, err := mgr.getter.Get(meta.FullID, meta.Category)
+	ent, err := mgr.getter.Get(nestBaseContext(), meta.FullID, meta.Category)
 	if err != nil || ent == nil || ent.Base() == nil {
 		return
 	}
@@ -277,7 +278,7 @@ func (mgr *NestMgr) dispatchGroupTransitionContinuation(req *GroupTransitionRequ
 	msg.Context = cont.Context.Clone()
 	checkRemoteId(msg, req.EntityID)
 	cont.RetChan = nil
-	mgr.dispatcher.SendMsg(msg)
+	mgr.dispatcher.sendMsg(msg)
 }
 
 func transitionLockGroupIDs(currentGroupID int64, targetGroupID int64, state entity.EntityGroupTransitionState) []int64 {
@@ -305,28 +306,27 @@ func transitionLockGroupIDs(currentGroupID int64, targetGroupID int64, state ent
 	return ret
 }
 
-func tryLockEntityLockGroups(groupIDs []int64) (func(), bool) {
-	locked := make([]int64, 0, len(groupIDs))
+func (mgr *NestMgr) tryLockEntityLockGroups(groupIDs []int64) (func(), bool) {
+	if mgr == nil || mgr.groupLockManager() == nil {
+		return func() {}, false
+	}
+	locked := make([]*entityLockGroupLockEntry, 0, len(groupIDs))
 	for _, groupID := range groupIDs {
-		mu := entityLockGroupMutex(groupID)
-		if mu == nil {
+		entry, ok := mgr.groupLockManager().acquire(groupID)
+		if groupID == 0 {
 			continue
 		}
-		if !mu.TryLock() {
+		if !ok {
 			for i := len(locked) - 1; i >= 0; i-- {
-				if lockedMu := entityLockGroupMutex(locked[i]); lockedMu != nil {
-					lockedMu.Unlock()
-				}
+				mgr.groupLockManager().release(locked[i])
 			}
 			return func() {}, false
 		}
-		locked = append(locked, groupID)
+		locked = append(locked, entry)
 	}
 	return func() {
 		for i := len(locked) - 1; i >= 0; i-- {
-			if mu := entityLockGroupMutex(locked[i]); mu != nil {
-				mu.Unlock()
-			}
+			mgr.groupLockManager().release(locked[i])
 		}
 	}, true
 }
@@ -378,14 +378,14 @@ func requeueNestDispatch(mgr *NestMgr, msg *Msg, reason string) bool {
 	}
 	next := msg.Clone()
 	next.RefCount = 0
-	next.RemoteRelease = nil
+	next.RemoteReleases = nil
 	next.PendingRequeues = msg.PendingRequeues + 1
 	msg.RetChan = nil
 	obs.IncCounter("nest.dispatch.requeue.total", obs.Labels{
 		"reason": reason,
 		"type":   msg.Type.String(),
 	}, 1)
-	mgr.dispatcher.DelaySendMsg(entityGroupDispatchRequeueDelay, next)
+	mgr.dispatcher.delaySendMsg(entityGroupDispatchRequeueDelay, next)
 	return true
 }
 

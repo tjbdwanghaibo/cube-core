@@ -1,8 +1,8 @@
 package nest
 
 import (
-	"github.com/tjbdwanghaibo/cube-core/misc"
 	"fmt"
+	"github.com/tjbdwanghaibo/cube-core/misc"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -67,6 +67,8 @@ func RangeAllTickCallback(f func(ff func(msg TickMsg))) {
 type Ticker struct {
 	duration     time.Duration
 	lastTickTime time.Time
+	tick         atomic.Uint64
+	callbacks    []func(TickMsg)
 	stopChan     chan struct{}
 	done         chan struct{}
 	started      atomic.Bool
@@ -78,11 +80,27 @@ func NewTicker(duration time.Duration) *Ticker {
 	if duration <= 0 {
 		duration = 100 * time.Millisecond
 	}
+	callbacks := make([]func(TickMsg), 0)
+	RangeAllTickCallback(func(cb func(TickMsg)) { callbacks = append(callbacks, cb) })
 	return &Ticker{
 		duration:     duration,
 		lastTickTime: time.Now(),
+		callbacks:    callbacks,
 		stopChan:     make(chan struct{}),
 		done:         make(chan struct{}),
+	}
+}
+
+func (t *Ticker) CurrentTick() uint64 {
+	if t == nil {
+		return 0
+	}
+	return t.tick.Load()
+}
+
+func (t *Ticker) SetCurrentTick(value uint64) {
+	if t != nil {
+		t.tick.Store(value)
 	}
 }
 
@@ -134,8 +152,7 @@ func (t *Ticker) run() {
 }
 
 func (t *Ticker) doTick() {
-	IncTick()
-	curFrame := CurTick()
+	curFrame := t.tick.Add(1)
 	now := time.Now()
 	var elapsed int64
 	if curFrame > 1 {
@@ -143,9 +160,9 @@ func (t *Ticker) doTick() {
 	}
 	t.lastTickTime = now
 	msg := TickMsg{Elapsed: elapsed, FrameNumber: curFrame}
-	RangeAllTickCallback(func(f func(msg TickMsg)) {
+	for _, f := range t.callbacks {
 		misc.SafeFunc(func() {
 			f(msg)
 		})
-	})
+	}
 }

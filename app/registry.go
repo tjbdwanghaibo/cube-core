@@ -31,6 +31,7 @@ func NewRegistry(cfg *viper.Viper) *Registry {
 	r.store[ModAdmin] = admin.NewRegistry()
 	r.store[ModAdminMetadata] = admin.NewMetadataRegistry()
 	r.store[ModLifecycle] = lifecycle.NewRegistry()
+	r.store[ModRuntimeFailure] = NewRuntimeFailure()
 	return r
 }
 

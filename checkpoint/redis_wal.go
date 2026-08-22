@@ -67,6 +67,7 @@ type SnapshotWALStats struct {
 }
 
 type redisSnapshotWALPayload struct {
+	Operation  string        `json:"operation,omitempty"`
 	Db         string        `json:"db,omitempty"`
 	DbScope    DatabaseScope `json:"db_scope,omitempty"`
 	Collection string        `json:"collection"`
@@ -80,6 +81,11 @@ type redisSnapshotWALPayload struct {
 	Data       []byte        `json:"data"`
 	CreatedAt  int64         `json:"created_at"`
 }
+
+const (
+	redisSnapshotWALOperationSave   = "save"
+	redisSnapshotWALOperationDelete = "delete"
+)
 
 func (p redisSnapshotWALPayload) saveOp() SaveOp {
 	return SaveOp{
@@ -95,6 +101,10 @@ func (p redisSnapshotWALPayload) saveOp() SaveOp {
 		Mode:       SaveModeFull,
 		Data:       append([]byte(nil), p.Data...),
 	}
+}
+
+func (p redisSnapshotWALPayload) removeOp() RemoveOp {
+	return RemoveOp{Db: p.Db, DbScope: p.DbScope, Collection: p.Collection, IDs: []int64{p.ID}, Fence: p.Fence, OwnerSid: p.OwnerSid, Shared: p.Shared}
 }
 
 type redisSnapshotWALTaskKind uint8
@@ -244,6 +254,20 @@ func (w *RedisSnapshotWAL) Submit(items []SaveItem) bool {
 	return ok
 }
 
+func (w *RedisSnapshotWAL) SubmitDelete(items []SaveItem) bool {
+	if w == nil || w.redis == nil || len(items) == 0 {
+		return true
+	}
+	ok := true
+	for _, item := range items {
+		task, valid := w.deleteTask(item)
+		if valid && !w.enqueue(task) {
+			ok = false
+		}
+	}
+	return ok
+}
+
 func (w *RedisSnapshotWAL) SubmitDurable(ctx context.Context, items []SaveItem) bool {
 	if w == nil || w.redis == nil || len(items) == 0 {
 		return true
@@ -268,6 +292,28 @@ func (w *RedisSnapshotWAL) SubmitDurable(ctx context.Context, items []SaveItem) 
 	return true
 }
 
+func (w *RedisSnapshotWAL) SubmitDeleteDurable(ctx context.Context, items []SaveItem) bool {
+	if w == nil || w.redis == nil || len(items) == 0 {
+		return true
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for _, item := range items {
+		task, valid := w.deleteTask(item)
+		if !valid {
+			continue
+		}
+		w.submitted.Add(1)
+		if err := w.writeSnapshot(ctx, task); err != nil {
+			w.errs.Add(1)
+			w.recordTaskError(task.kind)
+			return false
+		}
+	}
+	return true
+}
+
 func (w *RedisSnapshotWAL) Ack(ctx context.Context, items []SaveItem) error {
 	if w == nil || w.redis == nil || len(items) == 0 {
 		return nil
@@ -285,7 +331,9 @@ func (w *RedisSnapshotWAL) Ack(ctx context.Context, items []SaveItem) error {
 	}
 	if w.running.Load() {
 		for _, task := range tasks {
-			_ = w.enqueue(task)
+			if !w.enqueue(task) {
+				return errors.New("checkpoint redis wal: ack queue is full")
+			}
 		}
 		return nil
 	}
@@ -383,6 +431,7 @@ func (w *RedisSnapshotWAL) writeTask(item SaveItem) (redisSnapshotWALTask, bool)
 	}
 	target := redisSnapshotWALTarget(item)
 	payload := redisSnapshotWALPayload{
+		Operation:  redisSnapshotWALOperationSave,
 		Db:         item.Db,
 		DbScope:    item.DbScope,
 		Collection: item.Collection,
@@ -401,6 +450,21 @@ func (w *RedisSnapshotWAL) writeTask(item SaveItem) (redisSnapshotWALTask, bool)
 		target:  target,
 		shard:   redisSnapshotWALShard(target, w.cfg.Shards),
 		payload: payload,
+	}, true
+}
+
+func (w *RedisSnapshotWAL) deleteTask(item SaveItem) (redisSnapshotWALTask, bool) {
+	if item.Collection == "" || item.ID == 0 {
+		return redisSnapshotWALTask{}, false
+	}
+	target := redisSnapshotWALTarget(item)
+	return redisSnapshotWALTask{
+		kind: redisSnapshotWALTaskWrite, target: target, shard: redisSnapshotWALShard(target, w.cfg.Shards),
+		payload: redisSnapshotWALPayload{
+			Operation: redisSnapshotWALOperationDelete, Db: item.Db, DbScope: item.DbScope,
+			Collection: item.Collection, ID: item.ID, Fence: item.Fence, OwnerSid: item.OwnerSid,
+			Shared: item.Shared, CreatedAt: time.Now().UnixNano(),
+		},
 	}, true
 }
 
@@ -520,39 +584,74 @@ func (w *RedisSnapshotWAL) replayShard(ctx context.Context, backend StorageBacke
 		if len(payloads) == 0 {
 			continue
 		}
-		ops := make([]SaveOp, len(payloads))
-		tasks := make([]redisSnapshotWALTask, len(payloads))
-		for i, payload := range payloads {
-			ops[i] = payload.saveOp()
-			target := redisSnapshotWALPayloadTarget(payload)
-			tasks[i] = redisSnapshotWALTask{kind: redisSnapshotWALTaskAck, shard: shard, target: target}
-		}
-		results, err := backend.BulkSave(ctx, ops)
-		if err != nil {
-			return err
-		}
-		if len(results) != len(ops) {
-			return fmt.Errorf("checkpoint redis wal replay: result count %d, want %d", len(results), len(ops))
-		}
-		ackTasks := make([]redisSnapshotWALTask, 0, len(tasks))
-		for i, result := range results {
-			if result.OK || result.VersionConflict {
-				ackTasks = append(ackTasks, tasks[i])
-				w.replayed.Add(1)
-				obs.IncCounter("checkpoint_redis_wal_replay_total", obs.Labels{"result": "ok"}, 1)
-				continue
-			}
-			if result.Err != nil {
-				obs.IncCounter("checkpoint_redis_wal_replay_total", obs.Labels{"result": "error"}, 1)
-				return fmt.Errorf("checkpoint redis wal replay %s/%d: %w", ops[i].Collection, ops[i].ID, result.Err)
-			}
-			obs.IncCounter("checkpoint_redis_wal_replay_total", obs.Labels{"result": "error"}, 1)
-			return fmt.Errorf("checkpoint redis wal replay %s/%d failed", ops[i].Collection, ops[i].ID)
-		}
-		if err := w.ackTasks(ctx, ackTasks); err != nil {
+		if err := w.replayPayloadBatch(ctx, backend, shard, payloads); err != nil {
 			return err
 		}
 	}
+}
+
+func (w *RedisSnapshotWAL) replayPayloadBatch(ctx context.Context, backend StorageBackend, shard int, payloads []redisSnapshotWALPayload) error {
+	saveOps := make([]SaveOp, 0, len(payloads))
+	saveTasks := make([]redisSnapshotWALTask, 0, len(payloads))
+	deleteGroups := make(map[removeKey][]redisSnapshotWALPayload)
+	for _, payload := range payloads {
+		target := redisSnapshotWALPayloadTarget(payload)
+		task := redisSnapshotWALTask{kind: redisSnapshotWALTaskAck, shard: shard, target: target}
+		if payload.Operation == redisSnapshotWALOperationDelete {
+			key := removeKey{db: payload.Db, dbScope: payload.DbScope, coll: payload.Collection, fence: payload.Fence, ownerSid: payload.OwnerSid, shared: payload.Shared}
+			deleteGroups[key] = append(deleteGroups[key], payload)
+			continue
+		}
+		saveOps = append(saveOps, payload.saveOp())
+		saveTasks = append(saveTasks, task)
+	}
+	if len(saveOps) > 0 {
+		results, err := backend.BulkSave(ctx, saveOps)
+		if err != nil {
+			return err
+		}
+		if len(results) != len(saveOps) {
+			return fmt.Errorf("checkpoint redis wal replay: result count %d, want %d", len(results), len(saveOps))
+		}
+		acks := make([]redisSnapshotWALTask, 0, len(saveTasks))
+		for i, result := range results {
+			if !result.OK && !result.VersionConflict {
+				if result.Err != nil {
+					return fmt.Errorf("checkpoint redis wal replay %s/%d: %w", saveOps[i].Collection, saveOps[i].ID, result.Err)
+				}
+				return fmt.Errorf("checkpoint redis wal replay %s/%d failed", saveOps[i].Collection, saveOps[i].ID)
+			}
+			acks = append(acks, saveTasks[i])
+		}
+		if err := w.ackTasks(ctx, acks); err != nil {
+			return err
+		}
+		w.recordReplayed(len(acks))
+	}
+	for key, group := range deleteGroups {
+		ids := make([]int64, 0, len(group))
+		acks := make([]redisSnapshotWALTask, 0, len(group))
+		for _, payload := range group {
+			ids = append(ids, payload.ID)
+			acks = append(acks, redisSnapshotWALTask{kind: redisSnapshotWALTaskAck, shard: shard, target: redisSnapshotWALPayloadTarget(payload)})
+		}
+		if err := backend.BulkRemove(ctx, RemoveOp{Db: key.db, DbScope: key.dbScope, Collection: key.coll, IDs: ids, Fence: key.fence, OwnerSid: key.ownerSid, Shared: key.shared}); err != nil {
+			return err
+		}
+		if err := w.ackTasks(ctx, acks); err != nil {
+			return err
+		}
+		w.recordReplayed(len(acks))
+	}
+	return nil
+}
+
+func (w *RedisSnapshotWAL) recordReplayed(count int) {
+	if count <= 0 {
+		return
+	}
+	w.replayed.Add(int64(count))
+	obs.IncCounter("checkpoint_redis_wal_replay_total", obs.Labels{"result": "ok"}, int64(count))
 }
 
 func (w *RedisSnapshotWAL) recordTaskError(kind redisSnapshotWALTaskKind) {
@@ -623,14 +722,16 @@ func decodeRedisSnapshotWALPayload(raw []byte) (redisSnapshotWALPayload, error) 
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return redisSnapshotWALPayload{}, err
 	}
-	if payload.Collection == "" || payload.ID == 0 || len(payload.Data) == 0 {
-		return redisSnapshotWALPayload{}, fmt.Errorf("checkpoint redis wal: invalid payload collection=%q id=%d data=%d", payload.Collection, payload.ID, len(payload.Data))
+	if payload.Collection == "" || payload.ID == 0 ||
+		(payload.Operation != redisSnapshotWALOperationSave && payload.Operation != redisSnapshotWALOperationDelete) ||
+		(payload.Operation == redisSnapshotWALOperationSave && len(payload.Data) == 0) {
+		return redisSnapshotWALPayload{}, fmt.Errorf("checkpoint redis wal: invalid payload operation=%q collection=%q id=%d data=%d", payload.Operation, payload.Collection, payload.ID, len(payload.Data))
 	}
 	return payload, nil
 }
 
 func redisSnapshotWALPayloadTarget(payload redisSnapshotWALPayload) string {
-	return redisSnapshotWALTarget(SaveItem{Db: payload.Db, Collection: payload.Collection, ID: payload.ID})
+	return redisSnapshotWALTarget(SaveItem{Db: payload.Db, DbScope: payload.DbScope, Collection: payload.Collection, ID: payload.ID})
 }
 
 func redisSnapshotWALTarget(item SaveItem) string {

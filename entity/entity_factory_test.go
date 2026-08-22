@@ -42,7 +42,7 @@ func init() {
 		Kind:     testEntityKind,
 		Builder: func(param *EntityCreateParam) (IThreadSafeEntity, error) {
 			e := &factoryTestEntity{}
-			e.EntityBase = NewEntityBase(param.Id, param.Category, false, param.Kind)
+			e.EntityBase = NewEntityBaseWithMutex(param.Id, param.Category, false, param.Mutex, param.Kind)
 			e.ComponentManager = NewComponentManager()
 			e.DaoManager = NewDaoManager()
 			e.initCalled = true
@@ -64,7 +64,7 @@ func init() {
 		NoPersist:    true,
 		Builder: func(param *EntityCreateParam) (IThreadSafeEntity, error) {
 			return &factoryTestEntity{
-				EntityBase: NewEntityBase(param.Id, param.Category, true, param.Kind),
+				EntityBase: NewEntityBaseWithMutex(param.Id, param.Category, true, param.Mutex, param.Kind),
 			}, nil
 		},
 	})
@@ -75,22 +75,17 @@ func init() {
 		Lifetime:  EntityLifetimeRuntimeRebuild,
 		Builder: func(param *EntityCreateParam) (IThreadSafeEntity, error) {
 			return &factoryTestEntity{
-				EntityBase: NewEntityBase(param.Id, param.Category, true, param.Kind),
+				EntityBase: NewEntityBaseWithMutex(param.Id, param.Category, true, param.Mutex, param.Kind),
 			}, nil
 		},
 	})
 }
 
 func TestNewEntity_Create(t *testing.T) {
-	Mgr = NewEntityManager()
-	defer func() { Mgr = nil }()
-
-	// Set up global ID generator
 	var seq atomic.Uint64
-	GenerateID = func() (uint64, error) {
+	manager := NewEntityManager(WithEntityIDGenerator(func() (uint64, error) {
 		return seq.Add(1), nil
-	}
-	defer func() { GenerateID = nil }()
+	}))
 
 	param := &EntityCreateParam{
 		IsCreate: true,
@@ -98,7 +93,7 @@ func TestNewEntity_Create(t *testing.T) {
 		Kind:     testEntityKind,
 	}
 
-	e, err := NewEntity(param)
+	e, err := manager.Create(param)
 	if err != nil {
 		t.Fatalf("NewEntity: %v", err)
 	}
@@ -125,19 +120,103 @@ func TestNewEntity_Create(t *testing.T) {
 	}
 
 	// Should be in manager
-	if Mgr.Get(e.ID()) != e {
+	if manager.Get(e.ID()) != e {
 		t.Fatal("entity should be in manager")
 	}
 }
 
-func TestBuildEntity_RemoteManagedRequiresRemoteInterface(t *testing.T) {
-	GenerateID = func() (uint64, error) { return 1, nil }
-	defer func() { GenerateID = nil }()
+func TestEntityManagerCreateUsesInstanceDependencies(t *testing.T) {
+	var sequence atomic.Uint64
+	manager := NewEntityManager(WithEntityIDGenerator(func() (uint64, error) {
+		return sequence.Add(1), nil
+	}))
+	access := NewManagerAccess(manager)
+	value, err := access.Create(&EntityCreateParam{IsCreate: true, Kind: testEntityKind})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if value == nil || manager.Get(value.ID()) != value || value.UniqueID() != 1 {
+		t.Fatalf("instance create did not publish generated entity: %+v", value)
+	}
+	id := value.ID()
+	if err := access.Destroy(value, EntityDestroyReason(0), false); err != nil {
+		t.Fatal(err)
+	}
+	if manager.Get(id) != nil {
+		t.Fatal("instance destroy did not remove entity")
+	}
+}
 
+func TestEntityManagerCreateInScopeLocksBeforePublication(t *testing.T) {
+	manager := NewEntityManager()
+	id := mustBuildTestEntityID(t, 99, testEntityCategory, testEntityKind)
+	err := WithGuardScope("create_publish_order", func(scope *GuardScope) error {
+		value, err := manager.CreateInScope(scope, &EntityCreateParam{
+			Id:       id,
+			UniqueID: 99,
+			Category: testEntityCategory,
+			Kind:     testEntityKind,
+		})
+		if err != nil {
+			return err
+		}
+		if manager.Get(id) != value {
+			t.Fatal("entity was not published")
+		}
+		locked := make(chan bool, 1)
+		go func() {
+			if value.GetMutex().TryLock() {
+				value.GetMutex().Unlock()
+				locked <- true
+				return
+			}
+			locked <- false
+		}()
+		if <-locked {
+			t.Fatal("published entity mutex was not held by the creation scope")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInitEntitySyncInstallsContentState(t *testing.T) {
+	e := &factoryTestEntity{
+		EntityBase:       NewEntityBase(301, testEntityCategory, true, testEntityKind),
+		ComponentManager: NewComponentManager(),
+		DaoManager:       NewDaoManager(),
+	}
+	bp := &EntityBuilderParam{Sync: EntitySyncBuilderParam{
+		Enabled: true,
+		Topic:   "factory.subject",
+		PackerFactory: func(IThreadSafeEntity) SubjectSyncPacker {
+			return SubjectSyncPackFunc{
+				Snapshot: func(SyncProfile) (FrozenSyncPayload, error) {
+					return CopyFrozenSyncPayload(7, []byte("snapshot")), nil
+				},
+			}
+		},
+	}}
+
+	initEntitySync(e, nil, bp)
+	state := e.Sync()
+	if state == nil || state.SubjectID() != e.ID() || state.Namespace() != "factory.subject" || state.SubjectKind() != uint32(testEntityKind) {
+		t.Fatalf("subject sync state mismatch: %+v", state)
+	}
+	updates, err := state.CaptureSnapshot(nil, SyncFullReasonResync)
+	if err != nil || len(updates) != 1 || updates[0].Payload.Codec() != 7 {
+		t.Fatalf("subject snapshot updates=%+v err=%v", updates, err)
+	}
+}
+
+func TestBuildEntity_RemoteManagedRequiresRemoteInterface(t *testing.T) {
 	_, err := BuildEntity(&EntityCreateParam{
 		IsCreate: true,
 		Category: testEntityCategory,
 		Kind:     testRemoteBadKind,
+		UniqueID: 1,
 	})
 	if err == nil {
 		t.Fatal("expected remote managed policy validation error")
@@ -145,13 +224,11 @@ func TestBuildEntity_RemoteManagedRequiresRemoteInterface(t *testing.T) {
 }
 
 func TestBuildEntity_LifetimePolicy(t *testing.T) {
-	GenerateID = func() (uint64, error) { return 2, nil }
-	defer func() { GenerateID = nil }()
-
 	e, err := BuildEntity(&EntityCreateParam{
 		IsCreate: true,
 		Category: testEntityCategory,
 		Kind:     testRuntimeRebuildKind,
+		UniqueID: 2,
 	})
 	if err != nil {
 		t.Fatalf("BuildEntity: %v", err)
@@ -162,8 +239,7 @@ func TestBuildEntity_LifetimePolicy(t *testing.T) {
 }
 
 func TestNewEntity_Load(t *testing.T) {
-	Mgr = NewEntityManager()
-	defer func() { Mgr = nil }()
+	manager := NewEntityManager()
 
 	// Simulate loading with pre-existing DAO. Persistent IDs are full entity IDs.
 	wantID := mustBuildTestEntityID(t, 42, testEntityCategory, testEntityKind)
@@ -176,7 +252,7 @@ func TestNewEntity_Load(t *testing.T) {
 		Dao:      map[string]DaoInterface{"test_coll": existingDao},
 	}
 
-	e, err := NewEntity(param)
+	e, err := manager.Create(param)
 	if err != nil {
 		t.Fatalf("NewEntity: %v", err)
 	}
@@ -196,11 +272,7 @@ func TestNewEntity_Load(t *testing.T) {
 }
 
 func TestNewEntity_UnregisteredType(t *testing.T) {
-	Mgr = NewEntityManager()
-	defer func() { Mgr = nil }()
-
-	GenerateID = func() (uint64, error) { return 1, nil }
-	defer func() { GenerateID = nil }()
+	manager := NewEntityManager(WithEntityIDGenerator(func() (uint64, error) { return 1, nil }))
 
 	param := &EntityCreateParam{
 		IsCreate: true,
@@ -208,30 +280,26 @@ func TestNewEntity_UnregisteredType(t *testing.T) {
 		Kind:     EntityKind(255),
 	}
 
-	_, err := NewEntity(param)
+	_, err := manager.Create(param)
 	if err == nil {
 		t.Fatal("expected error for unregistered type")
 	}
 }
 
 func TestDestroyEntity(t *testing.T) {
-	Mgr = NewEntityManager()
-	defer func() { Mgr = nil }()
-
 	var seq atomic.Uint64
-	GenerateID = func() (uint64, error) { return seq.Add(1), nil }
-	defer func() { GenerateID = nil }()
+	manager := NewEntityManager(WithEntityIDGenerator(func() (uint64, error) { return seq.Add(1), nil }))
 
 	param := &EntityCreateParam{
 		IsCreate: true,
 		Category: testEntityCategory,
 		Kind:     testEntityKind,
 	}
-	e, _ := NewEntity(param)
+	e, _ := manager.Create(param)
 
-	DestroyEntity(e, testDestroyCommon, false)
+	manager.Remove(e, testDestroyCommon, false)
 
-	if Mgr.Get(e.ID()) != nil {
+	if manager.Get(e.ID()) != nil {
 		t.Fatal("entity should be removed from manager")
 	}
 	if !e.IsRemoved() {

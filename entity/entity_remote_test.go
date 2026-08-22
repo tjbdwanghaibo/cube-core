@@ -1,6 +1,9 @@
 package entity
 
-import "testing"
+import (
+	"sync"
+	"testing"
+)
 
 const (
 	testRemotePlayerKind   EntityKind = 101
@@ -75,6 +78,40 @@ func TestRemoteEntityBase_Interface(t *testing.T) {
 	}
 }
 
+func TestRemoteEntityBase_VersionVectorIsCoherent(t *testing.T) {
+	base := NewRemoteEntityBase(1, testEntityCategoryPlayer, false, testRemotePlayerKind)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for generation := uint64(2); generation < 10_000; generation++ {
+			if err := base.SetRemoteVersionVector(RemoteVersionVector{
+				StateVersion: generation,
+				MarkerEpoch:  generation,
+				LockFence:    generation,
+				RouteEpoch:   generation,
+			}); err != nil {
+				t.Errorf("set vector: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 10_000; i++ {
+			version := base.RemoteVersionVector()
+			if version.StateVersion == 0 {
+				continue
+			}
+			if version.StateVersion != version.MarkerEpoch || version.StateVersion != version.LockFence || version.StateVersion != version.RouteEpoch {
+				t.Errorf("torn version vector: %+v", version)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+}
+
 func TestRemoteEntityBase_IsRemoteCapable(t *testing.T) {
 	e := newTestRemoteEntity(100, testEntityCategoryPlayer)
 	if e.IsRemoteCapable() {
@@ -84,37 +121,6 @@ func TestRemoteEntityBase_IsRemoteCapable(t *testing.T) {
 	e2 := newMarkedTestRemoteEntity(200, testEntityCategoryPlayer)
 	if !e2.IsRemoteCapable() {
 		t.Fatal("entity with remote bit should be marked remote")
-	}
-}
-
-func TestRemoteCapableVsRemoteMarked(t *testing.T) {
-	id := makeEntityID(700, testEntityCategoryPlayer, EntityKind(3), true)
-	if !IsRemoteCapableEntityID(id) {
-		t.Fatal("remote-capable id should carry capability bit")
-	}
-	remoteEntityHooks.mu.Lock()
-	oldMarked := remoteEntityHooks.marked
-	remoteEntityHooks.mu.Unlock()
-	defer func() {
-		remoteEntityHooks.mu.Lock()
-		remoteEntityHooks.marked = oldMarked
-		remoteEntityHooks.mu.Unlock()
-	}()
-
-	remoteEntityHooks.mu.Lock()
-	remoteEntityHooks.marked = func(int64) bool { return false }
-	remoteEntityHooks.mu.Unlock()
-	if IsRemoteMarkedEntityID(id) {
-		t.Fatal("remote-capable id should not be marked when marker hook says false")
-	}
-	remoteEntityHooks.mu.Lock()
-	remoteEntityHooks.marked = func(int64) bool { return true }
-	remoteEntityHooks.mu.Unlock()
-	if !IsRemoteMarkedEntityID(id) {
-		t.Fatal("remote-capable id should be marked when marker hook says true")
-	}
-	if IsRemoteMarkedEntityID(clearRemoteCapableBit(id)) {
-		t.Fatal("non remote-capable id should never be remote-marked")
 	}
 }
 
@@ -145,16 +151,12 @@ func TestRemoteEntityBase_GUId(t *testing.T) {
 	}
 }
 
-func TestRemoteEntityHooks_Nil(t *testing.T) {
-	// Ensure nil hooks don't panic
-	remoteEntityHooks.mu.Lock()
-	remoteEntityHooks.preparer = nil
-	remoteEntityHooks.marked = nil
-	remoteEntityHooks.mu.Unlock()
-	if _, ok, err := PrepareRemoteEntities([]int64{1}); ok || err != nil {
-		t.Fatalf("PrepareRemoteEntities nil hook = ok:%v err:%v, want ok:false err:nil", ok, err)
+func TestRemoteSnapshotAllowStaleDoesNotBypassExpiry(t *testing.T) {
+	snapshot := RemoteSnapshot{Version: 1, ExpiresAt: 100}
+	if snapshot.Accepts(RemoteReadOption{AllowStale: true, NowMillis: 101}) {
+		t.Fatal("allow stale must not accept an expired cache entry")
 	}
-	if IsRemoteMarkedEntityID(makeEntityID(1, testEntityCategoryPlayer, EntityKindNone, true)) {
-		t.Fatal("nil marker hook should not mark remote entity")
+	if snapshot.Accepts(RemoteReadOption{AllowStale: true, NowMillis: 100}) {
+		t.Fatal("snapshot must expire at its expiry boundary")
 	}
 }

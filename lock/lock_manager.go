@@ -11,7 +11,6 @@ const defaultBucketCnt = 64
 type MutexFactory func(id int64) Mutex
 
 // LockManager manages a sharded pool of Mutex instances by entity ID.
-// Similar to entity.Mgr — set globally and used by entity system.
 type LockManager struct {
 	locks   *misc.BucketHolder[int64, Mutex]
 	factory MutexFactory
@@ -41,7 +40,3 @@ func (m *LockManager) GetLock(id int64) Mutex {
 func (m *LockManager) ReleaseLock(id int64) {
 	m.locks.Del(id)
 }
-
-// Mgr is the global lock manager instance.
-// Must be set by the application layer before creating entities.
-var Mgr *LockManager
